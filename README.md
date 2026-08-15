@@ -2,7 +2,7 @@
 
 [**中文**](./README.md) · [**English**](./README_EN.md)
 
-# 🐋 @dsh-external/dsh-desktop
+# 🐋 Dsh-Desktop
 
 **DeepSeek Harness 桌面端伴侣插件** —— 托盘鲸鱼图标 · 桌面快捷方式 · 开机自启直达桌面窗口 · 一键切换桌面/Web 模式
 
