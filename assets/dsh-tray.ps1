@@ -62,6 +62,12 @@ $harnessFile = Join-Path $scriptDir 'harness.json'
 $openStateFile = Join-Path $scriptDir 'open-state.json'
 $mutexName  = 'DSHDesktopTray'
 $launchMutexName = 'DSHDesktopHarnessLaunch'
+# 打开桌面窗口的互斥锁: 设置按钮/托盘/登录自启动可能并发触发 -Open,
+# 用同一 --user-data-dir 启动两个浏览器实例会打开两个窗口 (一透明一实体)
+$openMutexName = 'DSHDesktopOpenWindow'
+# 看守进程就绪标记: -Open 启动看守后等待该文件出现再启动浏览器,
+# 保证看守进程的"启动前窗口快照"先于浏览器窗口创建 (杜绝透明窗口)
+$watcherReadyFile = Join-Path $scriptDir 'watcher.ready'
 $runKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValue   = 'DSHDesktop'
 $shortcutName = 'DeepSeek Harness.lnk'
@@ -562,24 +568,46 @@ function Find-HwndOfPid([uint32]$targetPid) {
   return $script:fallbackHwnd
 }
 
-# 当前所有 chrome/msedge 进程的顶层 Chrome_WidgetWin_1 窗口句柄列表
+# 看守进程启动前已存在的所有 Chromium 顶层窗口快照。
+# 按窗口类名 (Chrome_WidgetWin_1) 而非进程名 chrome/msedge 收集:
+# 默认浏览器可能是任意 Chromium 内核 (Edge/Chrome/Brave/豆包 Doubao 等),
+# 进程名各不相同; 只按类名收集才能把"用户已有的浏览器窗口"全部记入快照,
+# 避免看守进程把用户原有的窗口误当作新窗口隐藏。
 function Get-ChromeHwnds {
-  $script:chromePids = @()
-  foreach ($p in (Get-Process chrome,msedge -ErrorAction SilentlyContinue)) { $script:chromePids += [int]$p.Id }
   $script:chromeHwnds = New-Object System.Collections.Generic.List[IntPtr]
   $cb = [DSHNative+EnumWindowsProc]{
     param($h, $l)
     $cls = New-Object System.Text.StringBuilder 256
     [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
-    if ($cls.ToString() -eq 'Chrome_WidgetWin_1') {
-      $wpid = [uint32]0
-      [void][DSHNative]::GetWindowThreadProcessId($h, [ref]$wpid)
-      if ($script:chromePids -contains [int]$wpid) { [void]$script:chromeHwnds.Add($h) }
-    }
+    if ($cls.ToString() -eq 'Chrome_WidgetWin_1') { [void]$script:chromeHwnds.Add($h) }
     return $true
   }
   [void][DSHNative]::EnumWindows($cb, [IntPtr]::Zero)
   return $script:chromeHwnds
+}
+
+# 启动后新出现的所有 Chromium 顶层窗口句柄列表 (不含看守进程启动前的窗口)。
+# 部分 Chromium 系浏览器 (如豆包 Doubao/某些 Edge 版本) 在 --app 模式下会额外
+# 创建未渲染的透明窗口; 看守进程必须隐藏全部新窗口, 渲染就绪后再恢复目标窗口,
+# 否则用户会同时看到"透明窗口 + 实体窗口"。
+# 注意: 不能用启动前的进程名过滤——浏览器进程是启动后新建的,
+# 只按"类名 Chrome_WidgetWin_1 且不在启动前快照中"判定, 并排除明显无窗口的
+# 后台辅助窗口 (无标题且不可见)。
+function Get-NewChromeHwnds {
+  $script:newChromeHwnds = New-Object System.Collections.Generic.List[IntPtr]
+  $cb = [DSHNative+EnumWindowsProc]{
+    param($h, $l)
+    if ($null -ne $script:appWindowPreexisting -and $script:appWindowPreexisting.Contains($h)) { return $true }
+    $cls = New-Object System.Text.StringBuilder 256
+    [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
+    if ($cls.ToString() -eq 'Chrome_WidgetWin_1') {
+      # 只收可见窗口 (启动瞬间的 app 窗口可见; 后台辅助窗口不可见, 无需处理)
+      if ([DSHNative]::IsWindowVisible($h)) { [void]$script:newChromeHwnds.Add($h) }
+    }
+    return $true
+  }
+  [void][DSHNative]::EnumWindows($cb, [IntPtr]::Zero)
+  return $script:newChromeHwnds
 }
 
 # 找到应用窗口句柄, 双通道 (均不依赖 WMI):
@@ -633,8 +661,10 @@ function Start-WatchAppWindow {
   try {
     $layout = Get-AppWindowLayout
     $script:appWindowPreexisting = Get-ChromeHwnds
+    # 快照完成: 通知 -Open 可以启动浏览器了 (保证"启动前窗口"快照先于新窗口创建,
+    # 这样 Find-AppWindowHandle 一定能把新窗口识别为"新窗口"并立即隐藏)
+    try { Set-Content -Path $watcherReadyFile -Value '1' -Encoding Ascii } catch { }
     $t0 = [Environment]::TickCount
-    $hwnd = [IntPtr]::Zero
     # 阶段 1: 等待窗口出现 (最多 30 秒)
     while ([Environment]::TickCount - $t0 -lt 30000) {
       $hwnd = Find-AppWindowHandle
@@ -642,12 +672,18 @@ function Start-WatchAppWindow {
       Start-Sleep -Milliseconds 100
     }
     if ($hwnd -eq [IntPtr]::Zero) { return }
-    # 阶段 2: 立即隐藏, 等待页面渲染就绪 (标题不再是 URL/New Tab, 或 5 秒超时)
-    [void][DSHNative]::ShowWindow($hwnd, 0)
+    # 阶段 2: 立即隐藏"本次启动新出现"的所有 chrome 顶层窗口 (不只是第一个):
+    # 部分 Chromium 系浏览器会额外创建未渲染的透明窗口, 只隐藏一个会导致
+    # "透明窗口 + 实体窗口"并存; 全部隐藏后, 渲染就绪时只恢复目标窗口。
+    $newHwnds = Get-NewChromeHwnds
+    foreach ($h in $newHwnds) { [void][DSHNative]::ShowWindow($h, 0) }
+    # 等页面渲染就绪 (标题不再是 URL/New Tab, 或 15 秒超时)。
+    # 就绪判断必须同时排除带协议的 URL (http://127.0.0.1:3080/), 否则页面还在
+    # 加载就会被误判为就绪而提前显示透明窗口。
     $t1 = [Environment]::TickCount
-    while ([Environment]::TickCount - $t1 -lt 5000) {
+    while ([Environment]::TickCount - $t1 -lt 15000) {
       $title = Get-WindowTitle $hwnd
-      if ($title -and $title -ne $origin -and $title -ne 'New Tab' -and $title -notmatch '^(localhost|127\.0\.0\.1):\d+$') { break }
+      if ($title -and $title -ne 'New Tab' -and $title -notmatch $origin -and $title -notmatch '(localhost|127\.0\.0\.1):\d+') { break }
       Start-Sleep -Milliseconds 150
     }
     # 阶段 2.5: 记录真实窗口所有者 PID (自愈; 窗口可能属于转发进程或既有的 Edge 实例)
@@ -706,42 +742,72 @@ function Start-WatchAppWindow {
 # 窗口使用黑鲸图标 (--app-user-model-id 匹配桌面快捷方式 + 看守进程 WM_SETICON);
 # 只有本机没有 Edge/Chrome 时才回退默认浏览器。
 function Open-HarnessWindow {
-  if ($null -ne (Get-AppWindowProcess)) { return 'app-existing' }
-  # 从网页端切换到桌面端: 先通知所有已打开的 Harness 页面自行关闭 (浏览器标签页/窗口)
-  [void](Send-QuitSignal)
-  $browser = Find-AppBrowser
-  if ($browser) {
-    $layout = Get-AppWindowLayout
-    $script:lastWindowInfo = ('{0}x{1} @ ({2},{3}) DIP, scale {4}' -f $layout.sizeDip.Width, $layout.sizeDip.Height, $layout.posDip.X, $layout.posDip.Y, $layout.scale)
-    $profileDir = Join-Path $scriptDir 'edge-profile'
-    $appArgs = '--app=' + $origin +
-               ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
-               ' --window-position=' + $layout.posDip.X + ',' + $layout.posDip.Y +
-               ' --user-data-dir="' + $profileDir + '"' +
-               ' --app-user-model-id=DSHDesktopApp' +
-               ' --no-first-run --no-default-browser-check --start-minimized'
-    # 先启动看守进程 (等窗口出现后隐藏→渲染就绪→恢复显示→守护最小尺寸), 再打开浏览器
-    Start-Process 'powershell.exe' -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-WatchAppWindow' -WindowStyle Hidden
-    # 通过带黑鲸图标的 .lnk 启动窗口: Windows 直接用该快捷方式的图标/名称作为
-    # 任务栏按钮 (而不是引擎的 logo), 并按 DSHDesktopApp 分组
-    $appLnk = Update-AppWindowShortcut $browser $appArgs
-    if ($appLnk -and (Test-Path $appLnk)) {
-      try {
-        $launched = Start-Process -FilePath $appLnk -PassThru
-        if ($null -ne $launched) { Write-AppWindowRecord $launched.Id }
-        return 'app'
-      } catch { }
+  # 并发防双开: 设置页按钮/托盘双击/登录自启动可能几乎同时触发打开流程,
+  # 若两个实例都用同一 --user-data-dir 启动浏览器, 会打开两个 app 窗口
+  # (一个渲染完成=实体, 一个还在加载=透明)。用命名互斥锁串行化整个打开流程。
+  $openMutex = New-Object System.Threading.Mutex($false, $openMutexName)
+  $ownedOpen = $false
+  try { $ownedOpen = $openMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ownedOpen = $true } catch { $ownedOpen = $false }
+  if (-not $ownedOpen) {
+    # 另一个打开流程正在进行: 等待它完成 (最多 30 秒), 期间窗口出现即视为已打开
+    for ($i = 0; $i -lt 60; $i++) {
+      Start-Sleep -Milliseconds 500
+      if ($null -ne (Get-AppWindowProcess)) { break }
     }
-    # 兜底: 直接启动浏览器 (图标退化为引擎 logo, 功能不受影响)
-    try {
-      $launched = Start-Process -FilePath $browser -ArgumentList $appArgs -PassThru
-      if ($null -ne $launched) { Write-AppWindowRecord $launched.Id }
-      return 'app'
-    } catch {
-      $script:lastWindowInfo = $null
+    try { $ownedOpen = $openMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ownedOpen = $true } catch { $ownedOpen = $false }
+    if (-not $ownedOpen) {
+      try { $openMutex.Dispose() } catch { }
+      return 'app-existing'
     }
   }
-  try { Start-Process $origin; return 'default' } catch { return 'none' }
+  try {
+    if ($null -ne (Get-AppWindowProcess)) { return 'app-existing' }
+    # 从网页端切换到桌面端: 先通知所有已打开的 Harness 页面自行关闭 (浏览器标签页/窗口)
+    [void](Send-QuitSignal)
+    $browser = Find-AppBrowser
+    if ($browser) {
+      $layout = Get-AppWindowLayout
+      $script:lastWindowInfo = ('{0}x{1} @ ({2},{3}) DIP, scale {4}' -f $layout.sizeDip.Width, $layout.sizeDip.Height, $layout.posDip.X, $layout.posDip.Y, $layout.scale)
+      $profileDir = Join-Path $scriptDir 'edge-profile'
+      $appArgs = '--app=' + $origin +
+                 ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
+                 ' --window-position=' + $layout.posDip.X + ',' + $layout.posDip.Y +
+                 ' --user-data-dir="' + $profileDir + '"' +
+                 ' --app-user-model-id=DSHDesktopApp' +
+                 ' --no-first-run --no-default-browser-check --start-minimized'
+      # 先启动看守进程 (等窗口出现后隐藏→渲染就绪→恢复显示→守护最小尺寸),
+      # 并等待它完成"启动前窗口快照"(watcher.ready) 再打开浏览器:
+      # 保证看守进程能识别到新窗口并立即隐藏, 渲染就绪前用户看不到透明窗口
+      Start-Process 'powershell.exe' -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-WatchAppWindow' -WindowStyle Hidden
+      for ($i = 0; $i -lt 80; $i++) {
+        if (Test-Path $watcherReadyFile) { break }
+        Start-Sleep -Milliseconds 100
+      }
+      Remove-Item $watcherReadyFile -Force -ErrorAction SilentlyContinue
+      # 通过带黑鲸图标的 .lnk 启动窗口: Windows 直接用该快捷方式的图标/名称作为
+      # 任务栏按钮 (而不是引擎的 logo), 并按 DSHDesktopApp 分组
+      $appLnk = Update-AppWindowShortcut $browser $appArgs
+      if ($appLnk -and (Test-Path $appLnk)) {
+        try {
+          $launched = Start-Process -FilePath $appLnk -PassThru
+          if ($null -ne $launched) { Write-AppWindowRecord $launched.Id }
+          return 'app'
+        } catch { }
+      }
+      # 兜底: 直接启动浏览器 (图标退化为引擎 logo, 功能不受影响)
+      try {
+        $launched = Start-Process -FilePath $browser -ArgumentList $appArgs -PassThru
+        if ($null -ne $launched) { Write-AppWindowRecord $launched.Id }
+        return 'app'
+      } catch {
+        $script:lastWindowInfo = $null
+      }
+    }
+    try { Start-Process $origin; return 'default' } catch { return 'none' }
+  } finally {
+    try { $openMutex.ReleaseMutex() } catch { }
+    try { $openMutex.Dispose() } catch { }
+  }
 }
 
 # 更新/创建应用窗口启动快捷方式 (黑鲸图标 + AppUserModelID):
