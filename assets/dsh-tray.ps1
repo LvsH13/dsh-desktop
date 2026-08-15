@@ -412,19 +412,21 @@ function Write-AppWindowRecord([int]$targetPid) {
 
 # 应用窗口进程。双通道检测, 不依赖单一机制:
 #   1) 记录 (纯 Win32, 首选): -Open 写入的窗口进程 PID, 要求进程存活、名为
-#      chrome/msedge 且有顶层 Chrome_WidgetWin_1 窗口 (看守进程会自愈为真实所有者);
+#      白名单浏览器 (chrome/msedge/brave/opera/vivaldi) 且有顶层
+#      Chrome_WidgetWin_1 窗口 (看守进程会自愈为真实所有者);
 #   2) CIM (正常环境可用): 命令行匹配 --app=<origin> (兼容引号包裹的 URL)。
+# 豆包 Doubao 等第三方浏览器不在白名单内, 其窗口/进程不会被当作桌面窗口。
 function Get-AppWindowProcess {
   $rec = Read-AppWindowRecord
   if ($null -ne $rec) {
     $proc = Get-Process -Id ([int]$rec.pid) -ErrorAction SilentlyContinue
-    if ($null -ne $proc -and ($proc.ProcessName -eq 'chrome' -or $proc.ProcessName -eq 'msedge') -and
+    if ($null -ne $proc -and (Test-BrowserProcessName $proc.ProcessName) -and
         (Find-HwndOfPid ([uint32][int]$rec.pid)) -ne [IntPtr]::Zero) {
       return @{ ProcessId = [int]$rec.pid; Via = 'record' }
     }
   }
   try {
-    $cim = Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction SilentlyContinue |
+    $cim = Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe' OR Name='brave.exe' OR Name='opera.exe' OR Name='vivaldi.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.CommandLine -match ('--app=["'']?' + [regex]::Escape($origin)) } |
       Select-Object -First 1
     if ($null -ne $cim) { return @{ ProcessId = [int]$cim.ProcessId; Via = 'cim' } }
@@ -437,11 +439,14 @@ function Get-AppWindowProcess {
 function Close-AppWindow {
   $rec = Read-AppWindowRecord
   if ($null -ne $rec) {
+    # 只结束白名单浏览器进程 (防残留的豆包等第三方记录被误杀)
     $proc = Get-Process -Id ([int]$rec.pid) -ErrorAction SilentlyContinue
-    if ($null -ne $proc) { & taskkill.exe /PID ([int]$rec.pid) /T /F 2>$null | Out-Null }
+    if ($null -ne $proc -and (Test-BrowserProcessName $proc.ProcessName)) {
+      & taskkill.exe /PID ([int]$rec.pid) /T /F 2>$null | Out-Null
+    }
   }
   try {
-    Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction SilentlyContinue |
+    Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe' OR Name='brave.exe' OR Name='opera.exe' OR Name='vivaldi.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.CommandLine -match ('--app=["'']?' + [regex]::Escape($origin)) } |
       ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F 2>$null | Out-Null }
   } catch { }
@@ -543,6 +548,29 @@ function Get-AppWindowLayout {
 
 # ---------- 应用窗口句柄与标题 ----------
 
+# 支持的浏览器进程名白名单 (应用模式引擎): 只认主流 Chromium 内核浏览器。
+# 明确排除豆包 Doubao / RoxyBrowser 等第三方套壳 —— 其进程名不在白名单内,
+# 窗口 (含透明悬浮窗) 永远不会被当作 DSH 桌面窗口目标或被看守进程处理。
+$supportedBrowserNames = @('chrome', 'msedge', 'brave', 'opera', 'vivaldi')
+
+# 刷新当前白名单浏览器进程 PID 集合 (每次窗口枚举前调用, 包含刚启动的引擎进程)
+function Get-SupportedBrowserPids {
+  $script:supportedBrowserPids = @()
+  foreach ($n in $supportedBrowserNames) {
+    foreach ($p in (Get-Process $n -ErrorAction SilentlyContinue)) {
+      $script:supportedBrowserPids += [int]$p.Id
+    }
+  }
+  return $script:supportedBrowserPids
+}
+
+# 判断进程名是否在白名单内
+function Test-BrowserProcessName([string]$name) {
+  if (-not $name) { return $false }
+  foreach ($n in $supportedBrowserNames) { if ($name -eq $n) { return $true } }
+  return $false
+}
+
 # 找到指定 PID 进程的顶层窗口句柄 (类名 Chrome_WidgetWin_1)。
 # 基于窗口枚举 (纯 Win32, 不依赖 WMI), 优先可见窗口,
 # 找不到时退回该进程的第一个此类窗口。
@@ -568,15 +596,17 @@ function Find-HwndOfPid([uint32]$targetPid) {
   return $script:fallbackHwnd
 }
 
-# 看守进程启动前已存在的所有 Chromium 顶层窗口快照。
-# 按窗口类名 (Chrome_WidgetWin_1) 而非进程名 chrome/msedge 收集:
-# 默认浏览器可能是任意 Chromium 内核 (Edge/Chrome/Brave/豆包 Doubao 等),
-# 进程名各不相同; 只按类名收集才能把"用户已有的浏览器窗口"全部记入快照,
-# 避免看守进程把用户原有的窗口误当作新窗口隐藏。
+# 看守进程启动前已存在的白名单浏览器窗口快照。
+# 只收集白名单进程 (chrome/msedge/brave/opera/vivaldi) 的窗口:
+# 豆包等第三方浏览器的窗口 (含透明悬浮窗) 一律不收集、不处理。
 function Get-ChromeHwnds {
+  [void](Get-SupportedBrowserPids)
   $script:chromeHwnds = New-Object System.Collections.Generic.List[IntPtr]
   $cb = [DSHNative+EnumWindowsProc]{
     param($h, $l)
+    $wpid = [uint32]0
+    [void][DSHNative]::GetWindowThreadProcessId($h, [ref]$wpid)
+    if ($script:supportedBrowserPids -notcontains [int]$wpid) { return $true }
     $cls = New-Object System.Text.StringBuilder 256
     [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
     if ($cls.ToString() -eq 'Chrome_WidgetWin_1') { [void]$script:chromeHwnds.Add($h) }
@@ -586,18 +616,19 @@ function Get-ChromeHwnds {
   return $script:chromeHwnds
 }
 
-# 启动后新出现的所有 Chromium 顶层窗口句柄列表 (不含看守进程启动前的窗口)。
-# 部分 Chromium 系浏览器 (如豆包 Doubao/某些 Edge 版本) 在 --app 模式下会额外
-# 创建未渲染的透明窗口; 看守进程必须隐藏全部新窗口, 渲染就绪后再恢复目标窗口,
-# 否则用户会同时看到"透明窗口 + 实体窗口"。
-# 注意: 不能用启动前的进程名过滤——浏览器进程是启动后新建的,
-# 只按"类名 Chrome_WidgetWin_1 且不在启动前快照中"判定, 并排除明显无窗口的
-# 后台辅助窗口 (无标题且不可见)。
+# 启动后新出现的白名单浏览器窗口句柄列表 (不含看守进程启动前的窗口)。
+# 看守进程隐藏全部新窗口, 渲染就绪后再恢复目标窗口, 防止"透明窗口 + 实体窗口"并存。
+# 注意: 不能用启动前的 PID 集合过滤——浏览器进程是启动后新建的, 枚举前重新刷新集合,
+# 且只收白名单浏览器进程的窗口 (豆包等第三方浏览器的窗口永不处理)。
 function Get-NewChromeHwnds {
+  [void](Get-SupportedBrowserPids)
   $script:newChromeHwnds = New-Object System.Collections.Generic.List[IntPtr]
   $cb = [DSHNative+EnumWindowsProc]{
     param($h, $l)
     if ($null -ne $script:appWindowPreexisting -and $script:appWindowPreexisting.Contains($h)) { return $true }
+    $wpid = [uint32]0
+    [void][DSHNative]::GetWindowThreadProcessId($h, [ref]$wpid)
+    if ($script:supportedBrowserPids -notcontains [int]$wpid) { return $true }
     $cls = New-Object System.Text.StringBuilder 256
     [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
     if ($cls.ToString() -eq 'Chrome_WidgetWin_1') {
@@ -611,22 +642,31 @@ function Get-NewChromeHwnds {
 }
 
 # 找到应用窗口句柄, 双通道 (均不依赖 WMI):
-#   1) 记录 PID 的窗口 (首选, -Open 写入, 看守进程自愈为真实所有者);
-#   2) 启动前不存在的 chrome/msedge 顶层窗口 (记录缺失/失效时兜底,
+#   1) 记录 PID 的窗口 (首选, -Open 写入, 看守进程自愈为真实所有者;
+#      记录 PID 必须属于白名单浏览器进程 —— 残留的豆包等第三方记录会被忽略);
+#   2) 启动前不存在的白名单浏览器顶层窗口 (记录缺失/失效时兜底,
 #      例如本机 Edge 已在运行、启动进程是转发进程的场景)。
 # 返回 [IntPtr]::Zero 表示未找到。
 function Find-AppWindowHandle {
   $rec = Read-AppWindowRecord
   if ($null -ne $rec) {
-    $hwnd = Find-HwndOfPid ([uint32][int]$rec.pid)
-    if ($hwnd -ne [IntPtr]::Zero) { return $hwnd }
+    # 记录 PID 必须是白名单浏览器进程, 否则忽略该记录 (防豆包悬浮窗被误当目标)
+    $recProc = Get-Process -Id ([int]$rec.pid) -ErrorAction SilentlyContinue
+    if ($null -ne $recProc -and (Test-BrowserProcessName $recProc.ProcessName)) {
+      $hwnd = Find-HwndOfPid ([uint32][int]$rec.pid)
+      if ($hwnd -ne [IntPtr]::Zero) { return $hwnd }
+    }
   }
   if ($null -eq $script:appWindowPreexisting) { return [IntPtr]::Zero }
+  [void](Get-SupportedBrowserPids)
   $script:newHwnd = [IntPtr]::Zero
   $script:newFallback = [IntPtr]::Zero
   $cb = [DSHNative+EnumWindowsProc]{
     param($h, $l)
     if ($script:appWindowPreexisting.Contains($h)) { return $true }
+    $wpid = [uint32]0
+    [void][DSHNative]::GetWindowThreadProcessId($h, [ref]$wpid)
+    if ($script:supportedBrowserPids -notcontains [int]$wpid) { return $true }
     $cls = New-Object System.Text.StringBuilder 256
     [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
     if ($cls.ToString() -eq 'Chrome_WidgetWin_1') {
@@ -686,10 +726,16 @@ function Start-WatchAppWindow {
       if ($title -and $title -ne 'New Tab' -and $title -notmatch $origin -and $title -notmatch '(localhost|127\.0\.0\.1):\d+') { break }
       Start-Sleep -Milliseconds 150
     }
-    # 阶段 2.5: 记录真实窗口所有者 PID (自愈; 窗口可能属于转发进程或既有的 Edge 实例)
+    # 阶段 2.5: 记录真实窗口所有者 PID (自愈; 窗口可能属于转发进程或既有的 Edge 实例)。
+    # 只写回白名单浏览器进程 (防豆包等第三方窗口被误记录为桌面窗口)
     $ownerPid = [uint32]0
     [void][DSHNative]::GetWindowThreadProcessId($hwnd, [ref]$ownerPid)
-    if ($ownerPid -gt 0) { Write-AppWindowRecord ([int]$ownerPid) }
+    if ($ownerPid -gt 0) {
+      $ownerProc = Get-Process -Id ([int]$ownerPid) -ErrorAction SilentlyContinue
+      if ($null -ne $ownerProc -and (Test-BrowserProcessName $ownerProc.ProcessName)) {
+        Write-AppWindowRecord ([int]$ownerPid)
+      }
+    }
     # 阶段 3: 恢复显示并按布局强制尺寸与居中位置, 设置黑鲸窗口图标 (标题栏/Alt-Tab)
     [void][DSHNative]::ShowWindow($hwnd, 9)
     $wScale = [DSHNative]::GetDpiForWindow($hwnd) / 96.0
