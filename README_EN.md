@@ -2,7 +2,7 @@
 
 [**中文**](./README.md) · [**English**](./README_EN.md)
 
-# 🐋 @dsh-external/dsh-desktop
+# 🐋 Dsh-Desktop
 
 **A desktop companion plugin for DeepSeek Harness** — tray whale icon · desktop shortcut · auto-start straight to the desktop window · one-click desktop/web switching
 
