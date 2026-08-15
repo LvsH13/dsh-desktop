@@ -1,0 +1,13 @@
+node_modules/
+*.log
+dist/
+.DS_Store
+Thumbs.db
+
+# 敏感信息：绝不提交 token / secrets
+.gitpub-secrets/
+secrets/
+*.token
+*.secret
+.env
+.env.*

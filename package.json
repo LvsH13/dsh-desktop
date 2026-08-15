@@ -1,0 +1,53 @@
+{
+  "name": "@dsh-external/dsh-desktop",
+  "version": "0.5.0",
+  "description": "DeepSeek Harness Windows desktop companion: tray icon (whale), desktop shortcut, login auto-start that opens the desktop window directly, and one-click desktop/web switching (local Edge/Chrome app mode).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "windows",
+    "desktop",
+    "tray",
+    "autostart"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LvsH13/dsh-desktop.git"
+  },
+  "homepage": "https://github.com/LvsH13/dsh-desktop",
+  "bugs": {
+    "url": "https://github.com/LvsH13/dsh-desktop/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "schemastery": "^3.18.0"
+  },
+  "license": "MIT"
+}

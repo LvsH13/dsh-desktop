@@ -1,0 +1,6 @@
+# dsh-desktop bundle patch: mounts the desktop app plugin into a profile layer stack.
+# The host half manages the tray companion, desktop shortcut and the auto-start
+# registry key; the client half renders the Settings section.
+- insert:
+    - id: dsh-desktop
+      name: '@dsh-external/dsh-desktop'
