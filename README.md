@@ -121,9 +121,15 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 
 ## 📸 成果展示
 
-> **📷 截图待添加** —— 把成果截图（如 `dsh-desktop封面.png`、托盘菜单、桌面窗口、设置页等）放入本会话工作区（`F:\Deepseek_Harness\.gitpub\dsh-desktop`）后告诉我，我会把它们排版进这里。
->
-> 当前仓库暂无截图；封面图就位后，本区块将替换为美观的截图网格/列表。
+| 🖥️ 桌面端 DeepSeek Harness | 🐋 托盘图标 |
+| :---: | :---: |
+| ![桌面端 DeepSeek Harness](images/desktop.png) | ![托盘鲸鱼图标](images/tray.png) |
+| 📌 桌面快捷方式 | 🗔 任务栏显示 |
+| :---: | :---: |
+| ![桌面快捷方式](images/shortcut.png) | ![任务栏中的 DeepSeek Harness](images/taskbar.png) |
+| ⚙️ 设置面板 · dsh-desktop | |
+| :---: | :---: |
+| ![设置面板中的 dsh-desktop](images/settings.png) | |
 
 ## 📄 许可证
 

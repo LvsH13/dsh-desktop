@@ -121,9 +121,15 @@ The **Last open** line reports the previous launch: readiness time (e.g. `ready 
 
 ## 📸 Showcase
 
-> **📷 Screenshots pending** — drop screenshots (e.g. `dsh-desktop封面.png`, tray menu, desktop window, Settings panel) into this session's workspace (`F:\Deepseek_Harness\.gitpub\dsh-desktop`) and ask me to lay them out here.
->
-> No screenshots are in the repository yet; once the cover image is in place, this section will be replaced with a clean screenshot grid/list.
+| 🖥️ Desktop DeepSeek Harness | 🐋 Tray icon |
+| :---: | :---: |
+| ![Desktop DeepSeek Harness](images/desktop.png) | ![Whale tray icon](images/tray.png) |
+| 📌 Desktop shortcut | 🗔 Taskbar |
+| :---: | :---: |
+| ![Desktop shortcut](images/shortcut.png) | ![DeepSeek Harness in the taskbar](images/taskbar.png) |
+| ⚙️ Settings panel · dsh-desktop | |
+| :---: | :---: |
+| ![dsh-desktop in the Settings panel](images/settings.png) | |
 
 ## 📄 License
 
