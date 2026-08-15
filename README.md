@@ -6,7 +6,7 @@
 
 **DeepSeek Harness 桌面端伴侣插件** —— 托盘鲸鱼图标 · 桌面快捷方式 · 开机自启直达桌面窗口 · 一键切换桌面/Web 模式
 
-![banner](assets/banner.svg)
+![cover](assets/cover.png)
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
