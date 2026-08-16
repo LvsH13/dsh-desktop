@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DeepSeek Harness 正在启动</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #ffffff;
+    color: #1f2328;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  .card { text-align: center; max-width: 420px; padding: 24px; }
+  .whale { width: 120px; height: 120px; margin: 0 auto 28px; }
+  .whale img { width: 100%; height: 100%; display: block; }
+  .loading { font-size: 18px; font-weight: 600; margin-bottom: 10px; }
+  .elapsed { font-size: 14px; color: #6e7781; font-variant-numeric: tabular-nums; }
+  .hint { display: none; margin-top: 22px; font-size: 13px; color: #9a6700; }
+  .hint a { color: #0969da; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="whale"><img src="data:image/png;base64,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SMW/8dqefDiUi0sH4HDqbXVR+WVIsDNYldwS9CO2F1gTGfMGcIhKh7glyC+y7+gKfYUtAv99RHp0FI4/agVKOUDlANgS1G66obaJaMCjtFucjTgd2dKReh3/vpYolvrlAz+GdAiJHD2Gn86qzzakHxM9wMmIhUD+ByFKLIUtvyuWByncOPcokSaUTBchKwNPDNYAN05vRSpnEmNPQlANsBiwKIgwIBx3+IIQdQn8P06FKp3pKJ3BTYKZF29OVVes1DyIIoeDYwcHT8bCnLPp2kxlSaWkSFNw9Bxdk39msUev1ZBUpBg09nAiKCfi+bfhPZEucCLYJ8x9wnZrPfwiqXAiWCd8KURYSpcQixwKEQPixKYVz4tx4cHfWyEokhpSVIknZ25F1lJk5hHPN3FGhoNkErrpHnGU+ZFitWd/byxf5JJLQCfgDxK1Ky8tnHqk7ZKTX+NQFJHTgAPs3csD03OCEZ1w17Q5F5EAqyUPEBlwTAh00IkPWgYRr6cHPlYMPg6deSKVIDbOpEDlGXtp6hFaWArs3emLQAsvHnQ+n+vwYRdJABMD24fbCjY87FgPTBRPiX4HvJ7ThvhbGqTyXuQy6KUXERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERmeP/HcOAlAx5J/sAAAAASUVORK5CYII=" alt="DeepSeek Harness"></div>
+    <div class="loading">加载中</div>
+    <div class="elapsed" id="elapsed">已等待 0 秒…</div>
+    <p class="hint" id="hint">启动耗时较长。如果长时间没有反应，<a href="#" onclick="location.reload()">点击这里重试</a>。</p>
+  </div>
+<script>
+  // 由托盘脚本以 boot.html?port=<port> 打开; 轮询本地服务, 就绪后跳转。
+  var port = parseInt(new URLSearchParams(location.search).get('port'), 10) || 3080;
+  var origin = 'http://127.0.0.1:' + port + '/';
+  var t0 = Date.now();
+  var timer = setInterval(function () {
+    var sec = Math.floor((Date.now() - t0) / 1000);
+    document.getElementById('elapsed').textContent = '已等待 ' + sec + ' 秒…';
+    if (sec >= 60) document.getElementById('hint').style.display = 'block';
+    // no-cors: 只探测网络可达性, 不读响应 (服务未就绪时连接被拒绝会抛错)
+    fetch(origin, { mode: 'no-cors', cache: 'no-store' })
+      .then(function () { clearInterval(timer); location.replace(origin); })
+      .catch(function () { /* 未就绪, 继续轮询 */ });
+  }, 500);
+</script>
+</body>
+</html>

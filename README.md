@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.5.0-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.6-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#环境要求)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -18,6 +18,10 @@
 **DeepSeek Harness 桌面端伴侣插件：托盘鲸鱼图标、桌面快捷方式、开机自启直达桌面窗口，一键切换桌面/Web 模式。**
 
 </div>
+
+> ⚠️ **仅支持 Windows**：本插件是 **Windows 10 / 11 专用**。在 macOS / Linux 上它虽然能被加载、不会崩溃，但托盘、桌面快捷方式、开机自启等桌面功能**无法工作**（这些依赖 Windows PowerShell 与任务计划程序），请在 Windows 环境使用。
+
+> 📌 **使用前请注意**：需要 **Node.js ≥ 20**（与 DeepSeek Harness 相同）；建议安装 **Microsoft Edge 或 Google Chrome**（应用模式桌面窗口需要 Chromium 内核，两者都无时回退为默认浏览器普通窗口）；全程**无需管理员权限**；卸载时需手动清理（托盘、自启、快捷方式、`%LOCALAPPDATA%\dsh-desktop`）。
 
 > 🚀 **重点：桌面端 = DeepSeek Harness + 一个插件，无需任何额外安装。**
 > DeepSeek Harness 的桌面体验完全以 **Web 插件** 的形式提供——不需要下载独立的桌面客户端、不需要重装、不需要管理员权限。
@@ -30,8 +34,10 @@
 | 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，右键菜单一键 **打开 / 退出**，随时掌控 Harness |
 | 🖥️ **原生桌面窗口** | 本地 Chromium 应用模式（`--app`）渲染：1352:972 自适应比例、屏幕居中、可自由缩放；独立浏览器 profile，扩展/通知/登录提示绝不泄漏进窗口，无启动闪烁 |
 | 🔄 **一键切换桌面/Web** | 设置页按钮随当前状态显示 **切换桌面端 / 切换网页端**，状态自动检测（无需 WMI），标签始终真实可靠 |
-| ⚡ **秒级启动** | 直接以 `node <entry> web` 启动 Harness（精确入口记录于 `harness.json`），登录自启就绪仅需数秒，无 npx 网络往返、无端口冲突 |
-| 🔁 **开机自启** | 写入 `HKCU\...\Run`（无需管理员权限），登录后后台拉起服务并**直接打开桌面窗口** |
+| ⚡ **秒级启动** | 登录任务以 `wscript.exe` 隐藏启动器（冷启动 <1s）直接拉起 `node <entry> web`（精确入口记录于 `harness.json`）；服务就绪前桌面窗口显示**内置启动页**，就绪后自动跳转；无 npx 网络往返、无端口冲突 |
+| 🔁 **开机自启** | 注册**任务计划程序登录触发器**（`DSHDesktop` 任务，无需管理员权限；`HKCU\...\Run` 仅作注册失败时的兜底），登录瞬间即触发，不排队等待启动队列 |
+| 🚀 **全程无终端闪现** | 所有外部 PowerShell 启动（快捷方式 / 托盘 / 登录任务）都经 `wscript.exe` 隐藏运行器（Win32 `SW_HIDE`），开机、打开、切换全程**无控制台窗口闪现** |
+| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；`tray.pid` 单一所有权 + 互斥锁 abandoned 处理保证**永远只有一个托盘**；quit 标记等待、自愈就绪等待、打开互斥锁全面防竞态 |
 | 🪟 **终端显隐** | 设置页一键显示/隐藏 Harness 终端窗口，控制台随心切换 |
 | ⚙️ **原生设置面板** | DSH Web UI 内新增 **桌面端** 设置区：状态卡片、一键操作、上次打开诊断 |
 
@@ -58,7 +64,7 @@ dsh plugin --profile web add github:LvsH13/dsh-desktop
 
 - 通知区域出现 🐋 鲸鱼托盘图标；
 - 设置页出现新的 **桌面端** 区块；
-- 开启自启后，登录即直接打开桌面窗口。
+- 开启自启后，登录即触发任务计划程序，秒级打开带启动页的桌面窗口（全程无终端闪现）。
 
 ### 方式二：从源码目录安装
 
@@ -90,7 +96,7 @@ dsh plugin --profile web add "FULL/PATH/TO/dsh-desktop"
 dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 ```
 
-然后（可选）：退出托盘、关闭自启（删除 `HKCU\...\Run` 中的 `DSHDesktop` 键值）、删除桌面快捷方式与 `%LOCALAPPDATA%\dsh-desktop` 目录。
+然后（可选）：退出托盘、关闭自启（删除 `DSHDesktop` 任务计划程序任务；若曾走 Run 键兜底，再删除 `HKCU\...\Run` 中的 `DSHDesktop` 键值）、删除桌面快捷方式与 `%LOCALAPPDATA%\dsh-desktop` 目录。
 
 ## 🚀 使用方法
 
@@ -99,7 +105,7 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 | 面板 | 功能 |
 | --- | --- |
 | 状态 | Harness 服务、托盘、桌面窗口、桌面快捷方式、自启、终端的实时状态 |
-| 开机自启动 | 开关登录自启（`HKCU Run`）；开启后登录即在后台拉起服务并直接打开桌面窗口 |
+| 开机自启动 | 开关登录自启（任务计划程序登录触发器，Run 键兜底）；开启后登录即秒级拉起服务，直接打开带启动页的桌面窗口 |
 | 操作 | **切换桌面端 / 切换网页端**（按当前模式显示标签）、启动/退出托盘、创建桌面快捷方式、显示/隐藏终端 |
 
 **上次打开** 一行会报告上次启动的就绪耗时（如 `就绪耗时 1.2s`）与窗口模式（`独立窗口` / `默认浏览器`），或失败原因——遇到卡顿时先看这里。
@@ -113,7 +119,8 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 | `harness.json` | 记录当前安装的精确 CLI 入口、node、DSH_HOME、origin、端口 |
 | `state.json` | `showTerminal` / `autoStart` 状态 |
 | `open-state.json` | 上次打开诊断（就绪耗时、窗口模式） |
-| 自启注册表 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DSHDesktop` |
+| 启动页 | `boot.html`——服务就绪前桌面窗口显示的黑色鲸鱼白底启动页，就绪后自动跳转 UI |
+| 自启方式 | 任务计划程序登录触发器（`DSHDesktop` 任务，无需管理员权限）；`HKCU\...\Run` 仅注册失败时兜底；当前生效方式见 `%LOCALAPPDATA%\dsh-desktop\autostart-method.json`（`task` / `runkey`） |
 | 桌面/Web 状态检测 | 双通道：记录窗口 PID（主）+ WMI 命令行匹配（兜底），无 WMI 环境同样可靠 |
 | 运行时依赖 | `schemastery`（唯一运行时依赖） |
 

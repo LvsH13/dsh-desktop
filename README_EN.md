@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.5.0-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.6-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#requirements)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -18,6 +18,10 @@
 **A Windows desktop companion for DeepSeek Harness: system tray (whale) icon, desktop shortcut, login auto-start straight into the desktop window, and one-click desktop/web switching.**
 
 </div>
+
+> ⚠️ **Windows-only**: This plugin is for **Windows 10 / 11**. On macOS / Linux it loads without crashing, but the desktop features — tray, desktop shortcut, auto-start — **will not work**, because they depend on Windows PowerShell and Task Scheduler.
+
+> 📌 **Before you install**: requires **Node.js ≥ 20** (same as DeepSeek Harness); **Microsoft Edge or Google Chrome** is recommended (the app-mode desktop window needs a Chromium engine — with neither, it falls back to a plain default-browser window); **no admin rights** required; uninstall needs manual cleanup (tray, auto-start, shortcut, `%LOCALAPPDATA%\dsh-desktop`).
 
 > 🚀 **Key point: the desktop experience = DeepSeek Harness + one plugin — no extra installation.**
 > DeepSeek Harness's desktop experience is delivered entirely as a **Web plugin**. No separate desktop client to download, no reinstall, no admin rights required.
@@ -30,8 +34,10 @@
 | 🐋 **System tray companion** | A whale icon in the notification area with a right-click menu: **Open / Quit** the harness |
 | 🖥️ **Native desktop window** | Rendered by your local Chromium in app mode (`--app`): 1352:972 adaptive ratio, centered, freely resizable; a dedicated browser profile keeps extensions, notifications and sign-in prompts out of the window; no startup flicker |
 | 🔄 **One-click desktop/web switching** | The Settings button shows **Switch to Desktop** in web mode and **Switch to Web** in desktop mode; state is detected without WMI, so the label is always truthful |
-| ⚡ **Fast boot** | Harness starts directly via `node <entry> web` (the exact entry is recorded in `harness.json`) — login auto-start is ready in seconds, with no npx round trip and no port conflicts |
-| 🔁 **Login auto-start toggle** | Writes `HKCU\...\Run` (no admin rights); at login the service starts in the background and the desktop window opens directly once ready |
+| ⚡ **Fast boot** | The logon task uses a `wscript.exe` hidden launcher (cold-start <1s) to start `node <entry> web` directly (the exact entry is recorded in `harness.json`); before the service is ready, the desktop window shows the **built-in boot page** and auto-redirects once ready; no npx round trip, no port conflicts |
+| 🔁 **Login auto-start toggle** | Registers a **Task Scheduler logon trigger** (the `DSHDesktop` task, no admin rights; `HKCU\...\Run` is only the fallback if registration fails) — fires immediately at sign-in, no startup-queue wait |
+| 🚀 **No console flash** | Every external PowerShell launch (shortcut / tray / logon task) goes through a `wscript.exe` hidden runner (Win32 `SW_HIDE`) — no console window ever flashes during boot, open or switching |
+| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; single `tray.pid` ownership + abandoned-mutex handling guarantee **exactly one tray**; quit-marker wait, self-healing readiness wait and an open mutex guard against races |
 | 🪟 **Show/hide terminal** | Toggle the harness terminal window from Settings |
 | ⚙️ **Native Settings panel** | A new **Desktop** section in the DSH Web UI: status cards, one-click actions, last-open diagnostics |
 
@@ -58,7 +64,7 @@ Then **restart the running Web profile**:
 
 - A 🐋 whale tray icon appears in the notification area;
 - A new **Desktop** section shows up in Settings;
-- Once auto-start is enabled, the desktop window opens directly at login.
+- Once auto-start is enabled, the logon task opens the desktop window with the boot page within seconds (no console flash).
 
 ### Option 2: Install from a source checkout
 
@@ -90,7 +96,7 @@ Restart the Web profile afterwards.
 dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 ```
 
-Optionally: quit the tray, disable auto-start (delete the `DSHDesktop` value under `HKCU\...\Run`), delete the desktop shortcut and remove `%LOCALAPPDATA%\dsh-desktop`.
+Optionally: quit the tray, disable auto-start (delete the `DSHDesktop` scheduled task; if the Run-key fallback was used, also delete the `DSHDesktop` value under `HKCU\...\Run`), delete the desktop shortcut and remove `%LOCALAPPDATA%\dsh-desktop`.
 
 ## 🚀 Usage
 
@@ -99,7 +105,7 @@ Open **Settings → Desktop**:
 | Panel | What it does |
 | --- | --- |
 | Status | Live state of the harness service, tray, desktop window, desktop shortcut, auto-start, terminal |
-| Auto-start | Enable/disable login auto-start (`HKCU Run`); when enabled, login starts the service in the background and opens the desktop window directly once ready |
+| Auto-start | Enable/disable login auto-start (Task Scheduler logon trigger, Run-key fallback); when enabled, login starts the service in seconds and opens the desktop window with the boot page directly |
 | Actions | **Switch to Desktop / Switch to Web** (labeled by the current mode), start/quit tray, create desktop shortcut, show/hide terminal |
 
 The **Last open** line reports the previous launch: readiness time (e.g. `ready in 1.2s`) and window mode (`standalone window` / `default browser`), or the failure reason — check this first when something feels slow.
@@ -113,7 +119,8 @@ The **Last open** line reports the previous launch: readiness time (e.g. `ready 
 | `harness.json` | Exact CLI entry of the running installation: node, DSH_HOME, origin, port |
 | `state.json` | `showTerminal` / `autoStart` state |
 | `open-state.json` | Last-open diagnostics (readiness time, window mode) |
-| Auto-start registry | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DSHDesktop` |
+| Boot page | `boot.html` — the black-whale-on-white page shown in the desktop window until the service is ready, then auto-redirects to the UI |
+| Auto-start method | Task Scheduler logon trigger (the `DSHDesktop` task, no admin rights); `HKCU\...\Run` is only the fallback when registration fails; the active method is recorded in `%LOCALAPPDATA%\dsh-desktop\autostart-method.json` (`task` / `runkey`) |
 | Desktop/web state detection | Dual-channel: recorded window PID (primary) + WMI command-line match (fallback) — reliable even without WMI |
 | Runtime dependency | `schemastery` (the only runtime dependency) |
 
