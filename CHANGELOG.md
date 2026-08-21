@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.7 — 2026-08-21
+
+- **Fixed repeated launch clicks**: `-Open`, `-OpenWeb`, and `-Restart` now share a
+  process-wide request mutex for the complete readiness flow. Once one launch is
+  underway, later shortcut/tray clicks return immediately instead of creating
+  competing PowerShell flows that can repeatedly start and stop `node.exe`.
+- **Added tray restart**: the new **重新启动** menu item restarts the Harness service
+  and desktop window while keeping the tray icon alive.
+- **Reduced quit-to-reopen latency**: known desktop-window PIDs close directly, and
+  normal single-node shutdown skips the full WMI process scan; the scan remains for
+  legacy roots or multiple Node processes.
+
 ## 0.7.6 — 2025-xx-xx
 
 - **Fixed: a console terminal flashed (or stayed visible) whenever the desktop

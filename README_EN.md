@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.6-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.7-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#requirements)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -31,15 +31,21 @@
 
 | Feature | Description |
 | --- | --- |
-| 🐋 **System tray companion** | A whale icon in the notification area with a right-click menu: **Open / Quit** the harness |
+| 🐋 **System tray companion** | A whale icon in the notification area with a right-click menu: **Open / Restart / Quit** the harness |
 | 🖥️ **Native desktop window** | Rendered by your local Chromium in app mode (`--app`): 1352:972 adaptive ratio, centered, freely resizable; a dedicated browser profile keeps extensions, notifications and sign-in prompts out of the window; no startup flicker |
 | 🔄 **One-click desktop/web switching** | The Settings button shows **Switch to Desktop** in web mode and **Switch to Web** in desktop mode; state is detected without WMI, so the label is always truthful |
 | ⚡ **Fast boot** | The logon task uses a `wscript.exe` hidden launcher (cold-start <1s) to start `node <entry> web` directly (the exact entry is recorded in `harness.json`); before the service is ready, the desktop window shows the **built-in boot page** and auto-redirects once ready; no npx round trip, no port conflicts |
 | 🔁 **Login auto-start toggle** | Registers a **Task Scheduler logon trigger** (the `DSHDesktop` task, no admin rights; `HKCU\...\Run` is only the fallback if registration fails) — fires immediately at sign-in, no startup-queue wait |
 | 🚀 **No console flash** | Every external PowerShell launch (shortcut / tray / logon task) goes through a `wscript.exe` hidden runner (Win32 `SW_HIDE`) — no console window ever flashes during boot, open or switching |
-| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; single `tray.pid` ownership + abandoned-mutex handling guarantee **exactly one tray**; quit-marker wait, self-healing readiness wait and an open mutex guard against races |
+| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; a single-flight launch mutex ignores repeated clicks instead of starting competing Node flows; quit-marker wait, self-healing readiness wait and tray ownership guards against races |
 | 🪟 **Show/hide terminal** | Toggle the harness terminal window from Settings |
 | ⚙️ **Native Settings panel** | A new **Desktop** section in the DSH Web UI: status cards, one-click actions, last-open diagnostics |
+
+### 0.7.7 iteration
+
+- Fixed slow quit-to-reopen behavior by closing known desktop-window PIDs directly and skipping unnecessary WMI scans for a normal single-node shutdown.
+- Fixed repeated shortcut/tray clicks starting competing PowerShell and Node launch flows.
+- Added tray **Restart**, which rebuilds the Harness service and desktop window while preserving the tray and auto-start configuration.
 
 ## 📦 Installation
 
@@ -54,7 +60,7 @@
 
 ### ⚡ Option 1: Install with a single command (recommended)
 
-Run in any terminal (requires the `dsh` CLI and pnpm — DSH plugin management is built on pnpm):
+Run in any terminal with an installed, working `dsh` CLI; the plugin manager handles dependency installation:
 
 ```sh
 dsh plugin --profile web add github:LvsH13/dsh-desktop
@@ -70,7 +76,7 @@ Then **restart the running Web profile**:
 
 ```sh
 git clone https://github.com/LvsH13/dsh-desktop.git
-dsh plugin --profile web add "FULL/PATH/TO/dsh-desktop"
+dsh plugin --profile web add "ABSOLUTE/PATH/TO/cloned/dsh-desktop"
 ```
 
 Restart the Web profile afterwards.

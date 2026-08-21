@@ -17,6 +17,7 @@
 #                                  窗口图标, 之后常驻守护最小尺寸, 窗口关闭后自行退出
 #   dsh-tray.ps1 -OpenWeb          切换到网页端: 确保服务运行, 关闭独立桌面窗口,
 #                                  用默认浏览器打开, 记录诊断信息后退出
+#   dsh-tray.ps1 -Restart         重启 Harness 服务并重新打开桌面窗口, 托盘保持运行
 #   dsh-tray.ps1 -AppWindowActive  检测独立桌面窗口是否在运行 (运行: 退出码 0, 未运行: 1)
 #   dsh-tray.ps1 -LayoutInfo       打印 DPI 感知的窗口布局计算 (尺寸/位置/缩放比) 后退出
 #   dsh-tray.ps1 -AutoStartOn      写入开机自启动 (HKCU Run) 后退出
@@ -155,6 +156,7 @@ param(
   [switch]$AutoStartDiag,
   [switch]$ShowTerminal,
   [switch]$HideTerminal,
+  [switch]$Restart,
   [switch]$Quit
 )
 $ErrorActionPreference = 'SilentlyContinue'
@@ -174,6 +176,7 @@ $openMutexName = 'DSHDesktopOpenWindow'
 # 看守进程就绪标记: -Open 启动看守后等待该文件出现再启动浏览器,
 # 保证看守进程的"启动前窗口快照"先于浏览器窗口创建 (杜绝透明窗口)
 $watcherReadyFile = Join-Path $scriptDir 'watcher.ready'
+$openRequestMutexName = 'DSHDesktopOpenRequest'
 $runKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runValue   = 'DSHDesktop'
 $shortcutName = 'DeepSeek Harness.lnk'
@@ -754,19 +757,22 @@ function Get-AppWindowProcess {
 # 记录 PID 通道 (纯 Win32, 首选) + 有界 CIM 命令行匹配通道 (正常环境), 并清除记录
 function Close-AppWindow {
   $rec = Read-AppWindowRecord
+  $recordHandled = $false
   if ($null -ne $rec) {
+    $recordHandled = $true
     # 只结束白名单浏览器进程 (防残留的豆包等第三方记录被误杀)
     $proc = Get-Process -Id ([int]$rec.pid) -ErrorAction SilentlyContinue
     if ($null -ne $proc -and (Test-BrowserProcessName $proc.ProcessName)) {
       & taskkill.exe /PID ([int]$rec.pid) /T /F 2>$null | Out-Null
     }
   }
-  # CIM 通道: 先快速确认有白名单浏览器进程在运行, 否则免 WMI 查询
-  $anyBrowser = $false
-  foreach ($n in $supportedBrowserNames) {
-    if ($null -ne (Get-Process $n -ErrorAction SilentlyContinue)) { $anyBrowser = $true; break }
+  if (-not $recordHandled) {
+    $anyBrowser = $false
+    foreach ($n in $supportedBrowserNames) {
+      if ($null -ne (Get-Process $n -ErrorAction SilentlyContinue)) { $anyBrowser = $true; break }
+    }
   }
-  if ($anyBrowser) {
+  if (-not $recordHandled -and $anyBrowser) {
     [void](Invoke-CimBounded {
       param($origin)
       Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe' OR Name='brave.exe' OR Name='opera.exe' OR Name='vivaldi.exe'" -ErrorAction SilentlyContinue |
@@ -1284,23 +1290,30 @@ function Stop-Harness {
     $targets.Add([int]$root.ProcessId)
     $found = $true
   }
-  $nodes = Invoke-CimBounded {
-    param($cutoff)
-    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object {
-        $_.Name -eq 'node.exe' -and
-        ($_.CommandLine -like '*@deepseek-ai/dsh*' -or $_.CommandLine -like '*@deepseek-ai\dsh*') -and
-        $_.CommandLine -like '*web*' -and
-        $_.CreationDate -lt $cutoff
-      }
-  } @($cutoff) 8
-  foreach ($n in $nodes) {
-    $targets.Add([int]$n.ProcessId)
-    $found = $true
+  $scanNodes = $null -eq $root -or ([string]$root.Name).ToLowerInvariant() -ne 'node.exe'
+  if (-not $scanNodes) {
+    $scanNodes = @((Get-Process node -ErrorAction SilentlyContinue)).Count -gt 1
+  }
+  if ($scanNodes) {
+    $nodes = Invoke-CimBounded {
+      param($cutoff)
+      Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+          $_.Name -eq 'node.exe' -and
+          ($_.CommandLine -like '*@deepseek-ai/dsh*' -or $_.CommandLine -like '*@deepseek-ai\dsh*') -and
+          $_.CommandLine -like '*web*' -and
+          $_.CreationDate -lt $cutoff
+        }
+    } @($cutoff) 8
+    foreach ($n in $nodes) {
+      $targets.Add([int]$n.ProcessId)
+      $found = $true
+    }
   }
   foreach ($targetPid in ($targets | Select-Object -Unique)) {
     & taskkill.exe /PID $targetPid /T /F 2>$null | Out-Null
   }
+  if (-not $found) { return $false }
   # 有界等待端口真正释放 (最多 8 秒): 让"退出后立刻重开"时新实例不会撞上
   # 正在关闭的旧实例 (端口占用 / 进程残留)
   $teardownT0 = [Environment]::TickCount
@@ -1351,6 +1364,27 @@ function Invoke-Quit {
   } finally {
     Remove-Item $quittingMarkFile -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Enter-OpenRequest {
+  $script:openRequestMutex = New-Object System.Threading.Mutex($false, $openRequestMutexName)
+  $owned = $false
+  try { $owned = $script:openRequestMutex.WaitOne(0) }
+  catch [System.Threading.AbandonedMutexException] { $owned = $true }
+  catch { $owned = $false }
+  if (-not $owned) {
+    try { $script:openRequestMutex.Dispose() } catch { }
+    $script:openRequestMutex = $null
+    return $false
+  }
+  return $true
+}
+
+function Exit-OpenRequest {
+  if ($null -eq $script:openRequestMutex) { return }
+  try { $script:openRequestMutex.ReleaseMutex() } catch { }
+  try { $script:openRequestMutex.Dispose() } catch { }
+  $script:openRequestMutex = $null
 }
 
 # 等待正在进行的退出完成 (v7.3): 标记消失, 且退出者进程已结束。
@@ -1703,6 +1737,21 @@ function Write-OpenState([bool]$ok, [long]$readyMs, [string]$browser, [string]$e
   try { $obj | ConvertTo-Json -Compress | Set-Content -Path $openStateFile -Encoding Ascii } catch { }
 }
 
+function Invoke-Restart {
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  Invoke-Quit
+  $ok = Ensure-Harness
+  $sw.Stop()
+  if ($ok) {
+    $script:lastWindowInfo = $null
+    $browser = Open-HarnessWindow
+    Write-OpenState $true $sw.ElapsedMilliseconds $browser $null $script:lastWindowInfo
+  } else {
+    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
+  }
+  return $ok
+}
+
 # ---------- 命令分发 ----------
 
 if ($ShortcutOk) {
@@ -1782,9 +1831,18 @@ if ($LayoutInfo) {
   exit 0
 }
 
+# -Restart: 托盘保持运行, 只重启 Harness 服务和桌面窗口。
+if ($Restart) {
+  if (-not (Enter-OpenRequest)) { exit 0 }
+  try { [void](Invoke-Restart) } finally { Exit-OpenRequest }
+  exit 0
+}
+
 # -OpenWeb: 切换到网页端 —— 确保服务运行, 关闭独立桌面窗口 (看守进程随窗口退出而自行结束),
 # 用默认浏览器打开, 记录诊断信息并退出
 if ($OpenWeb) {
+  if (-not (Enter-OpenRequest)) { exit 0 }
+  try {
   # 竞态防护: 若刚执行过"退出", 等待退出真正完成再启动 (避免撞上垂死旧实例)
   Wait-QuitFinished
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1803,11 +1861,14 @@ if ($OpenWeb) {
   } else {
     Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
   }
+  } finally { Exit-OpenRequest }
   exit 0
 }
 
 # -Open: 确保服务运行后打开 (独立窗口优先), 记录诊断信息并退出
 if ($Open) {
+  if (-not (Enter-OpenRequest)) { exit 0 }
+  try {
   # 竞态防护: 若刚执行过"退出", 等待退出真正完成再启动 (避免撞上垂死旧实例)
   Wait-QuitFinished
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1822,6 +1883,7 @@ if ($Open) {
   } else {
     Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
   }
+  } finally { Exit-OpenRequest }
   exit 0
 }
 
@@ -1921,6 +1983,10 @@ $openItem.Add_Click({
   # 'powershell.exe -WindowStyle Hidden' 作为参数要等 CLR 启动完成后才生效, 会闪现终端。
   Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
 })
+$restartItem = New-Object System.Windows.Forms.ToolStripMenuItem('重新启动')
+$restartItem.Add_Click({
+  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Restart'
+})
 $quitItem = New-Object System.Windows.Forms.ToolStripMenuItem('退出')
 # 退出 = 先停服务/关窗口/通知页面 (Invoke-Quit), 然后退出托盘
 $quitItem.Add_Click({
@@ -1935,6 +2001,7 @@ $quitItem.Add_Click({
   [System.Windows.Forms.Application]::Exit()
 })
 [void]$menu.Items.Add($openItem)
+[void]$menu.Items.Add($restartItem)
 [void]$menu.Items.Add($quitItem)
 $notify.ContextMenuStrip = $menu
 $notify.Add_DoubleClick({

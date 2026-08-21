@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.6-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.7-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#环境要求)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -31,15 +31,21 @@
 
 | 特性 | 说明 |
 | --- | --- |
-| 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，右键菜单一键 **打开 / 退出**，随时掌控 Harness |
+| 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，右键菜单一键 **打开 / 重新启动 / 退出**，随时掌控 Harness |
 | 🖥️ **原生桌面窗口** | 本地 Chromium 应用模式（`--app`）渲染：1352:972 自适应比例、屏幕居中、可自由缩放；独立浏览器 profile，扩展/通知/登录提示绝不泄漏进窗口，无启动闪烁 |
 | 🔄 **一键切换桌面/Web** | 设置页按钮随当前状态显示 **切换桌面端 / 切换网页端**，状态自动检测（无需 WMI），标签始终真实可靠 |
 | ⚡ **秒级启动** | 登录任务以 `wscript.exe` 隐藏启动器（冷启动 <1s）直接拉起 `node <entry> web`（精确入口记录于 `harness.json`）；服务就绪前桌面窗口显示**内置启动页**，就绪后自动跳转；无 npx 网络往返、无端口冲突 |
 | 🔁 **开机自启** | 注册**任务计划程序登录触发器**（`DSHDesktop` 任务，无需管理员权限；`HKCU\...\Run` 仅作注册失败时的兜底），登录瞬间即触发，不排队等待启动队列 |
 | 🚀 **全程无终端闪现** | 所有外部 PowerShell 启动（快捷方式 / 托盘 / 登录任务）都经 `wscript.exe` 隐藏运行器（Win32 `SW_HIDE`），开机、打开、切换全程**无控制台窗口闪现** |
-| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；`tray.pid` 单一所有权 + 互斥锁 abandoned 处理保证**永远只有一个托盘**；quit 标记等待、自愈就绪等待、打开互斥锁全面防竞态 |
+| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；单次启动请求互斥锁让重复点击立即忽略，不再重复拉起 Node；`tray.pid` 单一所有权 + quit 标记等待 + 自愈就绪等待保证启动稳定 |
 | 🪟 **终端显隐** | 设置页一键显示/隐藏 Harness 终端窗口，控制台随心切换 |
 | ⚙️ **原生设置面板** | DSH Web UI 内新增 **桌面端** 设置区：状态卡片、一键操作、上次打开诊断 |
+
+### 0.7.7 本次迭代
+
+- 修复退出后重新打开较慢：已知桌面窗口直接关闭，正常单 Node 退出跳过不必要的 WMI 扫描。
+- 修复连续点击快捷方式或托盘打开导致多个 PowerShell/Node 启动流程相互干扰的问题。
+- 新增托盘 **重新启动**：重启 Harness 服务和桌面窗口，同时保留托盘与开机自启动。
 
 ## 📦 安装方法
 
@@ -54,7 +60,7 @@
 
 ### ⚡ 方式一：一条命令安装（推荐）
 
-在任意终端执行（需要 `dsh` CLI 与 pnpm，DSH 插件管理依赖 pnpm）：
+在任意终端执行（需要已安装并可用的 `dsh` CLI；插件管理器会处理依赖安装）：
 
 ```sh
 dsh plugin --profile web add github:LvsH13/dsh-desktop
@@ -70,7 +76,7 @@ dsh plugin --profile web add github:LvsH13/dsh-desktop
 
 ```sh
 git clone https://github.com/LvsH13/dsh-desktop.git
-dsh plugin --profile web add "FULL/PATH/TO/dsh-desktop"
+dsh plugin --profile web add "克隆后的 dsh-desktop 目录绝对路径"
 ```
 
 同样需要重启 Web profile 后生效。
@@ -107,6 +113,8 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 | 状态 | Harness 服务、托盘、桌面窗口、桌面快捷方式、自启、终端的实时状态 |
 | 开机自启动 | 开关登录自启（任务计划程序登录触发器，Run 键兜底）；开启后登录即秒级拉起服务，直接打开带启动页的桌面窗口 |
 | 操作 | **切换桌面端 / 切换网页端**（按当前模式显示标签）、启动/退出托盘、创建桌面快捷方式、显示/隐藏终端 |
+
+托盘右键菜单中的 **重新启动** 会按顺序停止并重新启动 Harness，保留托盘图标和开机自启动设置；重启期间重复点击快捷方式或“重新启动”不会创建额外的 Node 实例。
 
 **上次打开** 一行会报告上次启动的就绪耗时（如 `就绪耗时 1.2s`）与窗口模式（`独立窗口` / `默认浏览器`），或失败原因——遇到卡顿时先看这里。
 
