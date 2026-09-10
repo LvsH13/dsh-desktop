@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.7-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.8-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#requirements)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -31,15 +31,22 @@
 
 | Feature | Description |
 | --- | --- |
-| 🐋 **System tray companion** | A whale icon in the notification area with a right-click menu: **Open / Restart / Quit** the harness |
+| 🐋 **System tray companion** | A whale icon in the notification area; **left-click to open/focus**, right-click menu: **Open / Restart / Quit** the harness |
 | 🖥️ **Native desktop window** | Rendered by your local Chromium in app mode (`--app`): 1352:972 adaptive ratio, centered, freely resizable; a dedicated browser profile keeps extensions, notifications and sign-in prompts out of the window; no startup flicker |
 | 🔄 **One-click desktop/web switching** | The Settings button shows **Switch to Desktop** in web mode and **Switch to Web** in desktop mode; state is detected without WMI, so the label is always truthful |
-| ⚡ **Fast boot** | The logon task uses a `wscript.exe` hidden launcher (cold-start <1s) to start `node <entry> web` directly (the exact entry is recorded in `harness.json`); before the service is ready, the desktop window shows the **built-in boot page** and auto-redirects once ready; no npx round trip, no port conflicts |
+| ⚡ **Fast boot & DevTools in-place navigation** | Cold-launches start with `node <entry> web --no-open` and display the **built-in boot page** immediately (visible in 3–5s); once ready, navigates the same window directly via **DevTools Protocol** without `SameSite=Strict` cookie blocks or dual-window issues |
 | 🔁 **Login auto-start toggle** | Registers a **Task Scheduler logon trigger** (the `DSHDesktop` task, no admin rights; `HKCU\...\Run` is only the fallback if registration fails) — fires immediately at sign-in, no startup-queue wait |
 | 🚀 **No console flash** | Every external PowerShell launch (shortcut / tray / logon task) goes through a `wscript.exe` hidden runner (Win32 `SW_HIDE`) — no console window ever flashes during boot, open or switching |
-| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; a single-flight launch mutex ignores repeated clicks instead of starting competing Node flows; quit-marker wait, self-healing readiness wait and tray ownership guards against races |
+| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; single-flight launch mutex ignores repeated clicks; `Test-HarnessHttp` recognizes 401 as ready; all 20s force-kill logic removed, cleanly taking over CLI/external instances |
 | 🪟 **Show/hide terminal** | Toggle the harness terminal window from Settings |
 | ⚙️ **Native Settings panel** | A new **Desktop** section in the DSH Web UI: status cards, one-click actions, last-open diagnostics |
+
+### 0.7.8 iteration
+
+- **Fixed port contention / repeated restarts**: `Test-HarnessHttp` recognizes 401 as ready; removed 20s zombie kill logic; background launches include `--no-open` to prevent opening duplicate default browser tabs.
+- **Fixed 401 authentication stuck on restart**: Automatically captures and parses CLI tokenized URL (`?token=...`) with timestamp freshness checks.
+- **DevTools Protocol in-place window navigation**: Single-window seamless transition from `boot.html` to authenticated Harness UI, resolving `SameSite=Strict` cross-origin cookie limitations and eliminating dual-window bugs.
+- **Tray left-click**: Left-click the tray icon to open/focus the desktop window.
 
 ### 0.7.7 iteration
 

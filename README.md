@@ -10,7 +10,7 @@
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.7-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.7.8-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#环境要求)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
@@ -31,21 +31,24 @@
 
 | 特性 | 说明 |
 | --- | --- |
-| 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，右键菜单一键 **打开 / 重新启动 / 退出**，随时掌控 Harness |
+| 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，**左键单击一键唤起/聚焦**，右键菜单提供 **打开 / 重新启动 / 退出**，随时掌控 Harness |
 | 🖥️ **原生桌面窗口** | 本地 Chromium 应用模式（`--app`）渲染：1352:972 自适应比例、屏幕居中、可自由缩放；独立浏览器 profile，扩展/通知/登录提示绝不泄漏进窗口，无启动闪烁 |
 | 🔄 **一键切换桌面/Web** | 设置页按钮随当前状态显示 **切换桌面端 / 切换网页端**，状态自动检测（无需 WMI），标签始终真实可靠 |
-| ⚡ **秒级启动** | 登录任务以 `wscript.exe` 隐藏启动器（冷启动 <1s）直接拉起 `node <entry> web`（精确入口记录于 `harness.json`）；服务就绪前桌面窗口显示**内置启动页**，就绪后自动跳转；无 npx 网络往返、无端口冲突 |
+| ⚡ **秒级启动 · 原地 DevTools 导航** | 登录任务以 `wscript.exe` 隐藏启动器（冷启动 <1s）直接拉起 `node <entry> web --no-open`；冷启动**提前显示内置启动页**（3–5s 可见），服务就绪后通过 **DevTools 协议原地导航**到认证地址，单窗口无缝切换、无 401 卡死、无端口冲突 |
 | 🔁 **开机自启** | 注册**任务计划程序登录触发器**（`DSHDesktop` 任务，无需管理员权限；`HKCU\...\Run` 仅作注册失败时的兜底），登录瞬间即触发，不排队等待启动队列 |
 | 🚀 **全程无终端闪现** | 所有外部 PowerShell 启动（快捷方式 / 托盘 / 登录任务）都经 `wscript.exe` 隐藏运行器（Win32 `SW_HIDE`），开机、打开、切换全程**无控制台窗口闪现** |
-| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；单次启动请求互斥锁让重复点击立即忽略，不再重复拉起 Node；`tray.pid` 单一所有权 + quit 标记等待 + 自愈就绪等待保证启动稳定 |
+| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；单次启动请求互斥锁让重复点击立即忽略，不再重复拉起 Node；`Test-HarnessHttp` 适配 401 认证响应，删除一切 20s 强杀逻辑，完美接管外部/CLI 实例 |
 | 🪟 **终端显隐** | 设置页一键显示/隐藏 Harness 终端窗口，控制台随心切换 |
 | ⚙️ **原生设置面板** | DSH Web UI 内新增 **桌面端** 设置区：状态卡片、一键操作、上次打开诊断 |
 
-### 0.7.7 本次迭代
+### 0.7.8 本次迭代
 
-- 修复退出后重新打开较慢：已知桌面窗口直接关闭，正常单 Node 退出跳过不必要的 WMI 扫描。
-- 修复连续点击快捷方式或托盘打开导致多个 PowerShell/Node 启动流程相互干扰的问题。
-- 新增托盘 **重新启动**：重启 Harness 服务和桌面窗口，同时保留托盘与开机自启动。
+- **修复抢占端口/反复拉起**：`Test-HarnessHttp` 正确识别 401 认证就绪，删除 20s 强杀僵尸逻辑，全面接管 CLI/外部实例；后台启动追加 `--no-open` 防止弹默认浏览器。
+- **修复重启/重开 401 卡死**：精准解析 CLI token 认证地址（带时间戳新鲜度校验），首次打开与重开均通过认证栅栏。
+- **DevTools 协议单窗口原地切换**：冷启动（`-Open` / `-Restart` / `-AutoStart`）3~5s 内先弹出启动页，服务就绪后通过 Chrome DevTools Protocol 原地导航至认证页，彻底解决跨站 `SameSite=Strict` cookie 限制与双窗口 bug。
+- **托盘左键单击**：支持左键单击托盘图标一键打开/唤起桌面窗口。
+
+### 0.7.7 历史迭代
 
 ## 📦 安装方法
 

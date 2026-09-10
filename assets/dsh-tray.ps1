@@ -24,7 +24,7 @@
 #   dsh-tray.ps1 -AutoStartOff     删除开机自启动后退出
 #   dsh-tray.ps1 -AutoStart        登录自启动模式: 免 npx 直连拉起 Harness 服务, 同时
 #                                  立即打开桌面窗口 (内置 boot.html 启动页, 服务就绪后
-#                                  自动跳转), 然后常驻托盘图标
+#                                  由 DevTools 协议原地切换到认证页), 然后常驻托盘图标
 #   dsh-tray.ps1 -ShowTerminal     显示 Harness 终端窗口后退出
 #   dsh-tray.ps1 -HideTerminal     隐藏 Harness 终端窗口后退出
 #   dsh-tray.ps1 -Quit             通知浏览器页面自动关闭、关闭桌面窗口后, 结束 Harness 终端与服务 (与托盘菜单"退出"共用同一逻辑)
@@ -46,7 +46,7 @@
 #   - -AutoStart 全程不依赖 WMI (TCP 端口探活 + 命名互斥锁), 并清除上一会话过期的
 #     app-window.json, 避免打开流程走 CIM 回退通道;
 #   - -AutoStart 不等 HTTP 就绪: 立即打开 boot.html 启动页 (窗口数秒内可见),
-#     页面轮询服务就绪后自动跳转到 Harness 界面。
+#     服务就绪后由 DevTools 协议在同一个窗口里切换到 Harness 界面。
 # v7 修复 (开机自启动仍然慢):
 #   - 计划任务注册不再用 schtasks /TR (反斜杠转义引号 \" 会被 schtasks 字面
 #     解析, 报 "系统找不到指定的路径" 而失败, 每次都回退 Run 键 —— 开机仍被
@@ -157,6 +157,7 @@ param(
   [switch]$ShowTerminal,
   [switch]$HideTerminal,
   [switch]$Restart,
+  [switch]$RetargetWhenReady,
   [switch]$Quit
 )
 $ErrorActionPreference = 'SilentlyContinue'
@@ -168,6 +169,10 @@ $stateFile  = Join-Path $scriptDir 'state.json'
 $legacyTerminalFile = Join-Path $scriptDir 'terminal.json'
 $harnessFile = Join-Path $scriptDir 'harness.json'
 $openStateFile = Join-Path $scriptDir 'open-state.json'
+# Harness 启动日志: 隐藏启动时重定向到这里, 用于解析 CLI 打印的认证 URL
+# (http://127.0.0.1:<port>/?token=...), 打开窗口时带上 token 避免 401。
+$harnessLogFile = Join-Path $scriptDir 'harness-console.log'
+$harnessErrFile = Join-Path $scriptDir 'harness-console.err.log'
 $mutexName  = 'DSHDesktopTray'
 $launchMutexName = 'DSHDesktopHarnessLaunch'
 # 打开桌面窗口的互斥锁: 设置按钮/托盘/登录自启动可能并发触发 -Open,
@@ -244,7 +249,9 @@ public static class DSHNative {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
   [DllImport("user32.dll")] public static extern bool GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW")] public static extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
   [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "PostMessageW")] public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -406,7 +413,10 @@ function Test-HarnessTcp {
   } catch { return $false }
 }
 
-# 权威就绪检查: TCP 通了不一定页面可用, HTTP 返回非 5xx 才算真正就绪
+# 权威就绪检查: TCP 通了不一定页面可用, HTTP 返回非 5xx 才算真正就绪。
+# 注意: 新版 Harness 需要浏览器认证, 未带 cookie 访问 "/" 会返回 401 ——
+# .NET 的 GetResponse 对 4xx 抛 WebException, 必须从异常里取状态码,
+# 否则会把"已就绪但需要认证"误判为"未就绪", 进而误杀进程/重复拉起。
 function Test-HarnessHttp {
   try {
     $req = [System.Net.HttpWebRequest]::Create($origin + '/')
@@ -414,9 +424,16 @@ function Test-HarnessHttp {
     $req.Method = 'GET'
     # 本地探测不走系统代理 (如 Clash 的 127.0.0.1:7897), 避免被代理转发/超时
     $req.Proxy = $null
-    $resp = $req.GetResponse()
-    $code = [int]$resp.StatusCode
-    $resp.Close()
+    $code = 0
+    try {
+      $resp = $req.GetResponse()
+      $code = [int]$resp.StatusCode
+      $resp.Close()
+    } catch [System.Net.WebException] {
+      if ($null -eq $_.Exception.Response) { return $false }
+      $code = [int]$_.Exception.Response.StatusCode
+      $_.Exception.Response.Close()
+    }
     return ($code -ge 200 -and $code -lt 500)
   } catch { return $false }
 }
@@ -465,7 +482,8 @@ function Start-Harness {
   if (-not (Test-Path $workDir)) { $workDir = $HOME }
   $show = $state.showTerminal
   if ($null -ne $entry -and (Test-Path $entry) -and $null -ne $nodeExe -and (Test-Path $nodeExe)) {
-    $argLine = '"' + $entry + '" web'
+    # --no-open: 由托盘/快捷方式负责打开桌面窗口, 避免 Harness 自己再弹一个默认浏览器
+    $argLine = '"' + $entry + '" web --no-open'
     if ($null -ne $webArgs -and $webArgs.Count -gt 0) { $argLine += ' ' + (($webArgs | Where-Object { $_ }) -join ' ') }
     $oldDshHome = $env:DSH_HOME
     try {
@@ -473,7 +491,9 @@ function Start-Harness {
       if ($show) {
         Start-Process -FilePath $nodeExe -ArgumentList $argLine -WorkingDirectory $workDir
       } else {
-        Start-Process -FilePath $nodeExe -ArgumentList $argLine -WorkingDirectory $workDir -WindowStyle Hidden
+        # 清空旧日志 (避免复用上一进程的失效 token), 并捕获 CLI 打印的认证 URL
+        Remove-Item $harnessLogFile, $harnessErrFile -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath $nodeExe -ArgumentList $argLine -WorkingDirectory $workDir -WindowStyle Hidden -RedirectStandardOutput $harnessLogFile -RedirectStandardError $harnessErrFile
       }
       return $true
     } catch {
@@ -482,15 +502,37 @@ function Start-Harness {
       if ($null -eq $oldDshHome) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue } else { $env:DSH_HOME = $oldDshHome }
     }
   }
-  $npxCmd = 'title DeepSeek Harness && npx --no-install @deepseek-ai/dsh web'
+  $npxCmd = 'title DeepSeek Harness && npx --no-install @deepseek-ai/dsh web --no-open'
   try {
     if ($show) {
       Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', $npxCmd) -WorkingDirectory $workDir
     } else {
-      Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', $npxCmd) -WorkingDirectory $workDir -WindowStyle Hidden
+      Remove-Item $harnessLogFile, $harnessErrFile -Force -ErrorAction SilentlyContinue
+      Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', $npxCmd) -WorkingDirectory $workDir -WindowStyle Hidden -RedirectStandardOutput $harnessLogFile -RedirectStandardError $harnessErrFile
     }
     return $true
   } catch { return $false }
+}
+
+# 读取当前 Harness 进程的认证 URL (CLI 启动时打印到日志的 ?token=... 地址)。
+# 仅当日志比进程创建时间新时才采用, 避免复用上一个进程的失效 token;
+# 命令行/手动启动的实例没有本日志, 返回 $null (调用方回退 origin + cookie)。
+function Get-HarnessAuthUrl {
+  try {
+    if (-not (Test-Path $harnessLogFile)) { return $null }
+    $logItem = Get-Item $harnessLogFile -ErrorAction SilentlyContinue
+    if ($null -eq $logItem) { return $null }
+    $node = Get-HarnessNode
+    if ($null -eq $node) { return $null }
+    $created = $null
+    try { $created = [datetime]$node.CreationDate } catch { $created = $null }
+    if ($null -ne $created -and $logItem.LastWriteTime -lt $created) { return $null }
+    $text = Get-Content -Path $harnessLogFile -Raw -ErrorAction SilentlyContinue
+    if (-not $text) { return $null }
+    $urlMatches = [regex]::Matches($text, 'http://127\.0\.0\.1:' + [string]$port + '/\?token=[A-Za-z0-9_\-]+')
+    if ($urlMatches.Count -eq 0) { return $null }
+    return $urlMatches[$urlMatches.Count - 1].Value
+  } catch { return $null }
 }
 
 # 正在运行的 Harness node 进程 (含正在启动中的实例)
@@ -562,28 +604,18 @@ function Ensure-Harness {
         if ($null -eq $running) {
           [void](Start-Harness)
         } else {
-          # 存在进程但端口未监听: 观察 (Get-Process 纯 Win32, 不依赖 WMI)
+          # 已有 Harness 进程（含命令行启动的实例）正在冷启动：只等待，绝不抢占/强杀。
           $observePid = [int]$running.ProcessId
           $observeT0 = [Environment]::TickCount
-          $spawned = $false
-          while ([Environment]::TickCount - $observeT0 -lt 20000) {
+          while ([Environment]::TickCount - $observeT0 -lt 30000) {
             if (Test-HarnessTcp) { break }
             if ($null -eq (Get-Process -Id $observePid -ErrorAction SilentlyContinue)) {
-              # 被观察的进程已退出: 是"退出后立刻重开"留下的垂死残留, 重新拉起
+              # 被观察的进程已退出: 等 300ms 后重新拉起
               Start-Sleep -Milliseconds 300
               [void](Start-Harness)
-              $spawned = $true
               break
             }
             Start-Sleep -Milliseconds 300
-          }
-          if (-not $spawned -and -not (Test-HarnessTcp)) {
-            # 20 秒端口仍无: 进程卡死或占着端口无法服务 —— 强杀后重新拉起
-            if ($null -ne (Get-Process -Id $observePid -ErrorAction SilentlyContinue)) {
-              & taskkill.exe /PID $observePid /T /F 2>$null | Out-Null
-              Start-Sleep -Milliseconds 500
-            }
-            [void](Start-Harness)
           }
         }
       }
@@ -594,19 +626,26 @@ function Ensure-Harness {
   } else {
     try { $launcher.Dispose() } catch { }
   }
-  # 等待就绪, 期间自我修复 (v7.3):
+  # 等待就绪, 期间自我修复:
   #   - 无进程且端口未监听 (之前拉起的实例被并发退出误杀/自身崩溃) → 重新拉起;
-  #   - 端口在监听但 HTTP 长时间不就绪 (垂死/卡死的僵尸实例, 如退出中的旧实例
-  #     残留) → 观察其启动时间, 够老 (>20 秒, 排除刚拉起的正常冷启动) 则强杀
-  #     后重新拉起 (只做一次);
-  #   保证"退出后立刻重开"即使撞上异常时序, 服务也必然可用, 不再干等 60 秒失败。
-  $recycleT0 = [Environment]::TickCount
-  $recycledPid = 0
-  for ($i = 0; $i -lt 140; $i++) {
+  #   - 有进程或端口在监听但 HTTP 未就绪 → 只等待, 不杀进程 (冷启动可能耗时
+  #     数分钟, 尤其是命令行启动的实例; 强杀会造成"抢占端口/重新连接报错")。
+  $waitT0 = [Environment]::TickCount
+  for ($i = 0; $i -lt 720; $i++) {
     Start-Sleep -Milliseconds 500
-    if (Test-HarnessHttp) { return $true }
-    if ([Environment]::TickCount - $recycleT0 -lt 15000) { continue }
-    $recycleT0 = [Environment]::TickCount
+    if (Test-HarnessHttp) {
+      # 刚由本脚本拉起时, CLI 打印的认证 URL 可能比监听就绪晚几毫秒才落盘;
+      # 短暂等待它出现, 保证 Open-HarnessWindow 能用 ?token=... 打开窗口。
+      for ($k = 0; $k -lt 25; $k++) {
+        if (-not (Test-Path $harnessLogFile)) { break }
+        $rawLog = Get-Content -Path $harnessLogFile -Raw -ErrorAction SilentlyContinue
+        if ($rawLog -and $rawLog -match '\?token=') { break }
+        Start-Sleep -Milliseconds 200
+      }
+      return $true
+    }
+    if ([Environment]::TickCount - $waitT0 -lt 15000) { continue }
+    $waitT0 = [Environment]::TickCount
     $tcpUp = Test-HarnessTcp
     $running = Get-HarnessNode
     if (-not $tcpUp -and $null -eq $running) {
@@ -620,29 +659,6 @@ function Ensure-Harness {
         } finally {
           try { $relauncher.ReleaseMutex() } catch { }
           try { $relauncher.Dispose() } catch { }
-        }
-      }
-    } elseif ($tcpUp -and $null -ne $running -and [int]$running.ProcessId -ne $recycledPid) {
-      # 端口在监听但 HTTP 一直不就绪: 僵尸实例 → 进程够老才强杀重拉
-      $proc = Get-Process -Id ([int]$running.ProcessId) -ErrorAction SilentlyContinue
-      if ($null -ne $proc) {
-        $ageSec = 999
-        try { $ageSec = ((Get-Date) - $proc.StartTime).TotalSeconds } catch { }
-        if ($ageSec -ge 20) {
-          & taskkill.exe /PID ([int]$running.ProcessId) /T /F 2>$null | Out-Null
-          $recycledPid = [int]$running.ProcessId
-          Start-Sleep -Milliseconds 800
-          $relauncher = New-Object System.Threading.Mutex($false, $launchMutexName)
-          $ownedRel = $false
-          try { $ownedRel = $relauncher.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ownedRel = $true } catch { $ownedRel = $false }
-          if ($ownedRel) {
-            try {
-              if (-not (Test-HarnessTcp)) { [void](Start-Harness) }
-            } finally {
-              try { $relauncher.ReleaseMutex() } catch { }
-              try { $relauncher.Dispose() } catch { }
-            }
-          }
         }
       }
     }
@@ -1139,8 +1155,9 @@ function Start-WatchAppWindow {
 # 以 --start-minimized 最小化启动, 由看守进程在渲染就绪后恢复显示并守护最小尺寸;
 # 窗口使用黑鲸图标 (--app-user-model-id 匹配桌面快捷方式 + 看守进程 WM_SETICON);
 # 只有本机没有 Edge/Chrome 时才回退默认浏览器。
-# -Boot (登录自启动): 不等服务就绪, 直接打开内置启动页 (boot.html 轮询就绪后
-# 自动跳转), 窗口在登录后数秒内可见; 不传 --start-minimized (看守进程超时退出时
+# -Boot (登录自启动): 不等服务就绪, 直接打开内置启动页, 窗口在登录后数秒内
+# 可见; 服务就绪后由 DevTools 协议把该窗口原地导航到认证页 (见
+# Invoke-CdpNavigateBootWindow)。不传 --start-minimized (看守进程超时退出时
 # 窗口依然可见)。
 function Open-HarnessWindow {
   param([switch]$Boot)
@@ -1173,12 +1190,17 @@ function Open-HarnessWindow {
       $layout = Get-AppWindowLayout
       $script:lastWindowInfo = ('{0}x{1} @ ({2},{3}) DIP, scale {4}' -f $layout.sizeDip.Width, $layout.sizeDip.Height, $layout.posDip.X, $layout.posDip.Y, $layout.scale)
       $profileDir = Join-Path $scriptDir 'edge-profile'
-      # 启动目标: 登录自启动时用内置启动页 (轮询就绪后跳转到 $origin), 让窗口
-      # 在 Harness 冷启动期间 (数十秒) 立即可见; 其它路径直接用服务地址。
+      # 启动目标: 登录自启动时用内置启动页 (服务就绪后由 DevTools 协议原地
+      # 导航, 见 Invoke-CdpNavigateBootWindow), 让窗口在 Harness 冷启动期间
+      # (数十秒) 立即可见; 其它路径优先使用 CLI 打印的认证地址 (?token=...),
+      # 首次打开即可通过 401 认证栅栏, 之后 cookie 生效。
       $target = $origin
       $bootPage = Join-Path $scriptDir 'boot.html'
       if ($Boot -and (Test-Path $bootPage)) {
         $target = 'file:///' + (($bootPage -replace '\\', '/') + '?port=' + $port)
+      } elseif (-not $Boot) {
+        $authUrl = Get-HarnessAuthUrl
+        if ($authUrl) { $target = $authUrl }
       }
       $appArgs = '--app=' + $target +
                  ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
@@ -1187,6 +1209,10 @@ function Open-HarnessWindow {
                  ' --app-user-model-id=DSHDesktopApp' +
                  ' --no-first-run --no-default-browser-check'
       if (-not $Boot) { $appArgs += ' --start-minimized' }
+      # 启动页窗口需要被 DevTools 协议原地导航到认证页 (浏览器级导航才能种下
+      # SameSite=Strict 认证 cookie, 且不会新开窗口)。port=0 让浏览器自己挑
+      # 一个空闲调试端口并写入 profile 目录的 DevToolsActivePort 文件。
+      if ($Boot) { $appArgs += ' --remote-debugging-port=0' }
       # 先启动看守进程 (等窗口出现后隐藏→渲染就绪→恢复显示→守护最小尺寸),
       # 并等待它完成"启动前窗口快照"(watcher.ready) 再打开浏览器:
       # 保证看守进程能识别到新窗口并立即隐藏, 渲染就绪前用户看不到透明窗口
@@ -1220,6 +1246,135 @@ function Open-HarnessWindow {
     try { $openMutex.ReleaseMutex() } catch { }
     try { $openMutex.Dispose() } catch { }
   }
+}
+
+# ---------- 启动页 → Harness 单窗口切换 (DevTools 协议) ----------
+#
+# 启动页是 file:// 页面, 由它自己 location.replace 到带 ?token= 的认证地址会
+# 落在 401: 认证 cookie 是 SameSite=Strict, 且 file:// → http://127.0.0.1 属于
+# 跨站导航, 303 重定向到 "/" 的请求不会带上刚种下的 cookie。旧实现改用"再启动
+# 一个 --app 进程"完成浏览器级导航, 但 Chromium 不会复用已有 app 窗口, 结果
+# 是两个窗口 (启动页 + 认证页) —— "重开总是多一个窗口" 的根因。
+#
+# 现在改为: 启动页窗口以 --remote-debugging-port=0 打开, 服务就绪后通过
+# DevTools 协议对同一个窗口发 Page.navigate(认证地址)。DevTools 导航没有发起
+# 方站点 (等同地址栏输入), 认证 cookie 正常生效, 窗口原样复用 (实测同一 target
+# 从 boot.html 变为 DeepSeek Harness 页面, 全程一个窗口)。
+
+# 等待 profile 的 DevToolsActivePort 出现并确认端点存活 (防端口文件残留)。
+function Get-BootCdpPort {
+  $dpFile = Join-Path (Join-Path $scriptDir 'edge-profile') 'DevToolsActivePort'
+  for ($i = 0; $i -lt 20; $i++) {
+    try {
+      if (Test-Path $dpFile) {
+        $first = Get-Content -Path $dpFile -TotalCount 1 -ErrorAction SilentlyContinue
+        $candidate = 0
+        if ($first -and [int]::TryParse(([string]$first).Trim(), [ref]$candidate) -and $candidate -gt 0) {
+          try {
+            [void](Invoke-RestMethod -Uri ('http://127.0.0.1:' + $candidate + '/json/version') -TimeoutSec 2)
+            return $candidate
+          } catch { }
+        }
+      }
+    } catch { }
+    Start-Sleep -Milliseconds 250
+  }
+  return 0
+}
+
+# 通过 DevTools 协议原地导航启动页窗口; 成功返回 $true。
+function Invoke-CdpNavigateBootWindow([string]$url) {
+  $cdpPort = Get-BootCdpPort
+  if ($cdpPort -le 0) { return $false }
+  try {
+    $targets = Invoke-RestMethod -Uri ('http://127.0.0.1:' + $cdpPort + '/json/list') -TimeoutSec 3
+  } catch { return $false }
+  # 优先选择启动页 target (boot.html), 找不到就退到第一个普通页面 target
+  $page = @($targets | Where-Object { $_.type -eq 'page' -and ([string]$_.url) -match 'boot\.html' }) | Select-Object -First 1
+  if ($null -eq $page) {
+    $page = @($targets | Where-Object { $_.type -eq 'page' }) | Select-Object -First 1
+  }
+  if ($null -eq $page -or -not $page.webSocketDebuggerUrl) { return $false }
+  $wsUrl = ([string]$page.webSocketDebuggerUrl) -replace 'localhost', '127.0.0.1'
+  try {
+    $ws = New-Object System.Net.WebSockets.ClientWebSocket
+    $ct = [System.Threading.CancellationToken]::None
+    if (-not $ws.ConnectAsync([Uri]$wsUrl, $ct).Wait(5000)) { try { $ws.Dispose() } catch { }; return $false }
+    $payload = '{"id":1,"method":"Page.navigate","params":{"url":' + (ConvertTo-Json $url -Compress) + '}}'
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $sent = $ws.SendAsync([System.ArraySegment[byte]]::new($bytes), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait(5000)
+    if ($sent) {
+      # 读一帧应答 (忽略内容) 再关闭, 避免立刻 Dispose 导致导航被取消
+      $buf = New-Object byte[] 4096
+      [void]$ws.ReceiveAsync([System.ArraySegment[byte]]::new($buf), $ct).Wait(2000)
+    }
+    try { $ws.Dispose() } catch { }
+    return [bool]$sent
+  } catch { return $false }
+}
+
+# 兼容回退路径 (DevTools 不可用时): 用浏览器进程直接打开带 token 的认证窗口。
+# 这是浏览器级导航, 认证一定成功, 但会短暂出现第二个窗口, 随后由
+# Close-BootWindow 把启动页窗口关掉。
+function Retarget-HarnessWindow {
+  $browser = Find-AppBrowser
+  if (-not $browser) { return $false }
+  $target = Get-HarnessAuthUrl
+  if (-not $target) { $target = $origin }
+  $layout = Get-AppWindowLayout
+  $profileDir = Join-Path $scriptDir 'edge-profile'
+  $appArgs = '--app=' + $target +
+             ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
+             ' --window-position=' + $layout.posDip.X + ',' + $layout.posDip.Y +
+             ' --user-data-dir="' + $profileDir + '"' +
+             ' --app-user-model-id=DSHDesktopApp' +
+             ' --no-first-run --no-default-browser-check'
+  $appLnk = Update-AppWindowShortcut $browser $appArgs
+  if ($appLnk -and (Test-Path $appLnk)) {
+    try { Start-Process -FilePath $appLnk | Out-Null; return $true } catch { }
+  }
+  try { Start-Process -FilePath $browser -ArgumentList $appArgs | Out-Null; return $true } catch { return $false }
+}
+
+# 回退路径收尾: 找到标题仍是启动页的 app 窗口, 只向它发 WM_CLOSE (不结束浏览器
+# 进程, 不影响新的认证窗口)。认证窗口若复用了同一窗口, 标题已变, 此处不会误关。
+function Close-BootWindow {
+  Ensure-DSHNative
+  $bootTitle = 'DeepSeek Harness 正在启动'
+  $script:bootHwnd = [IntPtr]::Zero
+  $cb = [DSHNative+EnumWindowsProc]{
+    param($h, $l)
+    if (-not [DSHNative]::IsWindowVisible($h)) { return $true }
+    $wpid = [uint32]0
+    [void][DSHNative]::GetWindowThreadProcessId($h, [ref]$wpid)
+    $p = Get-Process -Id $wpid -ErrorAction SilentlyContinue
+    if ($null -eq $p -or -not (Test-BrowserProcessName $p.ProcessName)) { return $true }
+    $cls = New-Object System.Text.StringBuilder 128
+    [void][DSHNative]::GetClassName($h, $cls, $cls.Capacity)
+    if ($cls.ToString() -ne 'Chrome_WidgetWin_1') { return $true }
+    $t = New-Object System.Text.StringBuilder 512
+    [void][DSHNative]::GetWindowTextW($h, $t, $t.Capacity)
+    if ($t.ToString() -eq $bootTitle) { $script:bootHwnd = $h; return $false }
+    return $true
+  }
+  [void][DSHNative]::EnumWindows($cb, [IntPtr]::Zero)
+  if ($script:bootHwnd -eq [IntPtr]::Zero) { return $false }
+  [void][DSHNative]::PostMessageW($script:bootHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CLOSE
+  return $true
+}
+
+# 服务就绪后把启动页窗口切换到 Harness 页面: 优先 DevTools 原地导航 (单窗口),
+# DevTools 不可用时回退"新开认证窗口 + 关闭启动页"。
+function Switch-BootWindowToHarness {
+  $target = Get-HarnessAuthUrl
+  if (-not $target) { $target = $origin }
+  if (Invoke-CdpNavigateBootWindow $target) { return 'cdp' }
+  if (Retarget-HarnessWindow) {
+    Start-Sleep -Milliseconds 1500
+    [void](Close-BootWindow)
+    return 'fallback'
+  }
+  return 'failed'
 }
 
 # 更新/创建应用窗口启动快捷方式 (黑鲸图标 + AppUserModelID):
@@ -1740,14 +1895,26 @@ function Write-OpenState([bool]$ok, [long]$readyMs, [string]$browser, [string]$e
 function Invoke-Restart {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   Invoke-Quit
+  # 冷启动反馈优化: 旧实例已停、端口已释放, 立即拉起服务进程并先打开内置
+  # 启动页窗口 (数秒内可见, 显示"正在启动"+已等待秒数), 服务就绪后由
+  # Switch-BootWindowToHarness 原地切换到认证页 —— 不再等 Ensure-Harness
+  # 全部就绪 (10 秒以上) 才让用户看到任何东西。
+  if (-not (Test-HarnessTcp)) { [void](Start-Harness) }
+  $browser = Open-HarnessWindow -Boot
   $ok = Ensure-Harness
   $sw.Stop()
   if ($ok) {
-    $script:lastWindowInfo = $null
-    $browser = Open-HarnessWindow
+    if ($browser -eq 'app' -or $browser -eq 'app-existing') {
+      # 服务已就绪: DevTools 协议把启动页窗口原地导航到认证页 (单窗口)
+      [void](Switch-BootWindowToHarness)
+    } else {
+      # 本机没有 Chromium 内核浏览器时启动页不可用: 服务已就绪, 回退常规
+      # 路径 (带 ?token= 认证地址) 打开。
+      $browser = Open-HarnessWindow
+    }
     Write-OpenState $true $sw.ElapsedMilliseconds $browser $null $script:lastWindowInfo
   } else {
-    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
+    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 360s' $null
   }
   return $ok
 }
@@ -1851,7 +2018,9 @@ if ($OpenWeb) {
   Close-AppWindow
   if ($ok) {
     try {
-      Start-Process $origin
+      $openUrl = Get-HarnessAuthUrl
+      if (-not $openUrl) { $openUrl = $origin }
+      Start-Process $openUrl
       Write-OpenState $true $sw.ElapsedMilliseconds 'default' $null $null
     } catch {
       Write-OpenState $false $sw.ElapsedMilliseconds $null 'failed to open default browser' $null
@@ -1859,7 +2028,7 @@ if ($OpenWeb) {
     # 先打开浏览器, 再补托盘 (托盘缺失时): 用户先看到结果, 托盘在后台跟上
     Ensure-TrayRunning
   } else {
-    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
+    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 360s' $null
   }
   } finally { Exit-OpenRequest }
   exit 0
@@ -1872,18 +2041,50 @@ if ($Open) {
   # 竞态防护: 若刚执行过"退出", 等待退出真正完成再启动 (避免撞上垂死旧实例)
   Wait-QuitFinished
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  # 冷启动反馈优化: 服务未就绪时, 先打开内置启动页窗口 (数秒内可见), 再等待
+  # 服务就绪; 就绪后用 DevTools 协议原地切换到认证页。服务已就绪时维持原路径
+  # (带 ?token= 认证地址直接打开 Harness)。
+  $earlyBoot = -not (Test-HarnessHttp)
+  $browser = $null
+  if ($earlyBoot) { $browser = Open-HarnessWindow -Boot }
   $ok = Ensure-Harness
   $sw.Stop()
   if ($ok) {
-    $script:lastWindowInfo = $null
-    $browser = Open-HarnessWindow
+    if ($earlyBoot) {
+      if ($browser -eq 'app' -or $browser -eq 'app-existing') {
+        # 服务已就绪: DevTools 协议把启动页窗口原地导航到认证页
+        # (浏览器级导航才能通过 SameSite=Strict 认证; 窗口只有一个)
+        [void](Switch-BootWindowToHarness)
+      } elseif ($browser -eq 'none' -or $browser -eq 'default') {
+        $script:lastWindowInfo = $null
+        $browser = Open-HarnessWindow
+      }
+    } else {
+      $script:lastWindowInfo = $null
+      $browser = Open-HarnessWindow
+    }
     # 先打开窗口, 再补托盘 (托盘缺失时): 窗口尽快可见, 托盘在后台跟上
     Ensure-TrayRunning
     Write-OpenState $true $sw.ElapsedMilliseconds $browser $null $script:lastWindowInfo
   } else {
-    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 70s' $null
+    Write-OpenState $false $sw.ElapsedMilliseconds $null 'harness did not become ready within 360s' $null
   }
   } finally { Exit-OpenRequest }
+  exit 0
+}
+
+# -RetargetWhenReady: 登录自启动的补位进程 —— 等 Harness 就绪后, 用 DevTools
+# 协议把已打开的启动页窗口原地导航到带 token 的认证页 (单窗口)。
+if ($RetargetWhenReady) {
+  for ($i = 0; $i -lt 720; $i++) {
+    if (Test-HarnessHttp) {
+      # 服务就绪: 原地切换启动页窗口 (见 Switch-BootWindowToHarness)
+      Start-Sleep -Milliseconds 700
+      [void](Switch-BootWindowToHarness)
+      break
+    }
+    Start-Sleep -Milliseconds 500
+  }
   exit 0
 }
 
@@ -1894,9 +2095,10 @@ if ($WatchAppWindow) {
 }
 
 # -AutoStart: 登录自启动。不等服务就绪 —— 立即后台拉起服务 (免 npx 直连,
-# 端口/互斥锁防重复), 同时直接打开桌面窗口 (内置启动页轮询就绪后自动跳转),
-# 然后进入托盘。全程不依赖 WMI: 开机初期 WMI 服务未就绪时 Get-CimInstance
-# 可能阻塞数分钟, 这里只用 TCP 端口探活 + 命名互斥锁。
+# 端口/互斥锁防重复), 同时直接打开桌面窗口 (内置启动页, 服务就绪后由
+# -RetargetWhenReady 补位进程原地切换到认证页), 然后进入托盘。全程不依赖
+# WMI: 开机初期 WMI 服务未就绪时 Get-CimInstance 可能阻塞数分钟, 这里只用
+# TCP 端口探活 + 命名互斥锁。
 if ($AutoStart) {
   # 条件式提前登记托盘 PID (仅当当前没有托盘在运行时): 让宿主 apply 看到"托盘已在/
   # 将启动"而不补拉重复托盘进程 (避免开机多付一次 PowerShell 冷启动); 若与宿主补拉的
@@ -1941,6 +2143,9 @@ if ($AutoStart) {
   # 避免 Open-HarnessWindow 的 CIM 回退通道在开机初期被 WMI 阻塞
   Remove-Item $appWindowFile -Force -ErrorAction SilentlyContinue
   [void](Open-HarnessWindow -Boot)
+  # 启动页窗口出现后, 另起一个隐藏进程在服务就绪时用 DevTools 协议把该窗口
+  # 原地切换到带 token 的认证页 (同一个窗口, 见 Switch-BootWindowToHarness)。
+  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-RetargetWhenReady'
   # 自动迁移 (不阻塞上面的启动流程): 本次若仍由 Run 键触发 (计划任务未创建过),
   # 立即迁移到计划任务登录触发器并删除 Run 键 —— 下次登录起不再被 Explorer 的
   # 启动项队列拖慢。迁移失败 (如计划任务服务被禁用) 时保持 Run 键, 行为与旧版一致。
@@ -2006,6 +2211,14 @@ $quitItem.Add_Click({
 $notify.ContextMenuStrip = $menu
 $notify.Add_DoubleClick({
   Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+})
+# 左键单击图标: 启动/恢复 Harness 并打开桌面窗口 (与双击、桌面快捷方式同一路径;
+# 命令行走的就是 -Open → Ensure-Harness 复用已有实例, 不会抢占端口或重复启动)
+$notify.Add_MouseClick({
+  param($sender, $e)
+  if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+    Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+  }
 })
 
 [System.Windows.Forms.Application]::Run()

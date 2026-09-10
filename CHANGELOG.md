@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.8 — 2026-09-11
+
+- **Fixed port contention / repeated restarts on boot**:
+  - `Test-HarnessHttp` now handles HTTP 401 as a valid "ready" response (Harness 0.1.5+ web authentication required). `.NET` `WebException` is now parsed to extract status codes instead of treating all exceptions as offline.
+  - Removed all aggressive 20s zombie kill logic in `Ensure-Harness` — external/CLI instances are now safely waited for and taken over (up to 360s timeout).
+  - Added `--no-open` flag to background Node/NPX invocations to prevent duplicate default browser tab popups.
+- **Fixed 401 authentication stuck on restart/reopen**:
+  - Automatically captures and parses the CLI tokenized authentication URL (`?token=...`) from redirected console logs (`harness-console.log`) with strict freshness checking against process creation time.
+- **Added tray left-click handler**:
+  - Left-clicking the tray icon now opens/focuses the desktop window (equivalent to double-click / desktop shortcut).
+- **Fast cold-start feedback & seamless single-window transition (DevTools Protocol)**:
+  - Cold launches (`-Open` / `-Restart` / `-AutoStart`) display the built-in `boot.html` window immediately (visible in ~3-5s).
+  - Once Harness service is HTTP-ready, navigates the existing boot window directly to the authenticated URL via Chrome DevTools Protocol (`Page.navigate`), avoiding `SameSite=Strict` cookie restrictions and preventing dual-window artifacts.
+  - `boot.html` updated with clean loading timers and fallback manual links.
+
 ## 0.7.7 — 2026-08-21
 
 - **Fixed repeated launch clicks**: `-Open`, `-OpenWeb`, and `-Restart` now share a
