@@ -4,6 +4,10 @@ dist/
 .DS_Store
 Thumbs.db
 
+# 内部交接与修复说明文档（不发布至公开仓库）
+OPENCODE_FIXES_*.md
+*.bak*
+
 # 敏感信息：绝不提交 token / secrets
 .gitpub-secrets/
 secrets/
