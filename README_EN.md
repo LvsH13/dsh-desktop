@@ -4,18 +4,18 @@
 
 # 🐋 Dsh-Desktop
 
-**A desktop companion plugin for DeepSeek Harness** — tray whale icon · desktop shortcut · auto-start straight to the desktop window · one-click desktop/web switching
+**A desktop companion plugin for DeepSeek Harness** — tray whale icon · desktop shortcut · auto-start (opens desktop app or web browser per setting) · one-click desktop/web switching
 
 ![cover](assets/cover.png)
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.8-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.8.1-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#requirements)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
 
-**A Windows desktop companion for DeepSeek Harness: system tray (whale) icon, desktop shortcut, login auto-start straight into the desktop window, and one-click desktop/web switching.**
+**A Windows desktop companion for DeepSeek Harness: system tray (whale) icon, desktop shortcut, login auto-start (opens exactly the client you chose: desktop app window or web browser), and one-click desktop/web switching.**
 
 </div>
 
@@ -32,27 +32,26 @@
 | Feature | Description |
 | --- | --- |
 | 🐋 **System tray companion** | A whale icon in the notification area; **left-click to open/focus**, right-click menu: **Open / Restart / Quit** the harness |
-| 🖥️ **Native desktop window** | Rendered by your local Chromium in app mode (`--app`): 1352:972 adaptive ratio, centered, freely resizable; a dedicated browser profile keeps extensions, notifications and sign-in prompts out of the window; no startup flicker |
+| 🖥️ **Native desktop window** | Rendered by your local Chromium in app mode (`--app`): 1352:972 adaptive ratio, centered, freely resizable; a dedicated browser profile suppresses Google Translate popups and keeps extensions, notifications and sign-in prompts out of the window; no startup flicker |
 | 🔄 **One-click desktop/web switching** | The Settings button shows **Switch to Desktop** in web mode and **Switch to Web** in desktop mode; state is detected without WMI, so the label is always truthful |
-| ⚡ **Fast boot & DevTools in-place navigation** | Cold-launches start with `node <entry> web --no-open` and display the **built-in boot page** immediately (visible in 3–5s); once ready, navigates the same window directly via **DevTools Protocol** without `SameSite=Strict` cookie blocks or dual-window issues |
-| 🔁 **Login auto-start toggle** | Registers a **Task Scheduler logon trigger** (the `DSHDesktop` task, no admin rights; `HKCU\...\Run` is only the fallback if registration fails) — fires immediately at sign-in, no startup-queue wait |
+| ⚡ **Fast boot & service-first shortcut launcher** | Fast launchers (`dsh-open.vbs` / `dsh-autostart.vbs`) start Node service directly while window prepares in parallel; displays the **built-in boot page** immediately (visible in 3–5s), then navigates directly via **DevTools Protocol** without `SameSite=Strict` cookie blocks or dual-window issues |
+| 🔁 **Login auto-start (two options)** | Registers a **Task Scheduler logon trigger** (the `DSHDesktop` task, no admin rights; `HKCU\...\Run` fallback); embeds `--no-open` to prevent dual-window popups, and introduces **`autoStartMode` setting (desktop app window or web browser)** — strictly opens one client |
 | 🚀 **No console flash** | Every external PowerShell launch (shortcut / tray / logon task) goes through a `wscript.exe` hidden runner (Win32 `SW_HIDE`) — no console window ever flashes during boot, open or switching |
-| 🛡️ **Reopen · tray self-heal · race guards** | Reopen immediately after quit; single-flight launch mutex ignores repeated clicks; `Test-HarnessHttp` recognizes 401 as ready; all 20s force-kill logic removed, cleanly taking over CLI/external instances |
+| 🛡️ **Port safety · circuit breaker · tray self-heal** | Reopen immediately after quit; precise launch timestamp prevents competing Node flows from fighting over ports; automatic circuit breaker trips after 3 failed launches (records to `launch-failures.json`); full lifecycle marker cleanup |
 | 🪟 **Show/hide terminal** | Toggle the harness terminal window from Settings |
-| ⚙️ **Native Settings panel** | A new **Desktop** section in the DSH Web UI: status cards, one-click actions, last-open diagnostics |
+| ⚙️ **Native Settings panel** | A new **Desktop** section in the DSH Web UI: skeleton loading, eliminated redundant probes, client open mode selector, status cards, last-open diagnostics |
 
-### 0.7.8 iteration
+### 0.8.1 / 0.8.0 iteration
 
-- **Fixed port contention / repeated restarts**: `Test-HarnessHttp` recognizes 401 as ready; removed 20s zombie kill logic; background launches include `--no-open` to prevent opening duplicate default browser tabs.
-- **Fixed 401 authentication stuck on restart**: Automatically captures and parses CLI tokenized URL (`?token=...`) with timestamp freshness checks.
-- **DevTools Protocol in-place window navigation**: Single-window seamless transition from `boot.html` to authenticated Harness UI, resolving `SameSite=Strict` cross-origin cookie limitations and eliminating dual-window bugs.
-- **Tray left-click**: Left-click the tray icon to open/focus the desktop window.
+- **Fast shortcut launch**: `dsh-open.vbs` upgraded to a fast launcher that starts Node directly; cold-start is no longer serialized behind PowerShell CLR startup and window setup.
+- **Fixed dual-window popup at login**: Added `--no-open` to the logon launcher, eliminating the duplicate default browser tab on boot.
+- **New `autoStartMode` setting**: Added option in Settings to choose whether login auto-start opens the dedicated desktop app window or the default web browser (strictly one client).
+- **Port gate & relaunch protection**: Rewrote launch gate in `Start-Harness` to avoid spawning a second Node when one is already starting; added auto-relaunch circuit breaker after 3 failures (`launch-failures.json`).
+- **Suppressed Google Translate bubble**: Automatically sets `translate.enabled: false` in dedicated profile to prevent translate popups in Chrome 138+.
+- **Readiness detection & port auto-correction**: `Test-HarnessHttp` rejects 404 responses during startup; `Wait-HarnessToken` waits until the full plugin tree is loaded before opening windows (eliminating workspace loading delay); `harness.json` auto-corrects port from `webServer.port`.
+- **Performance optimizations**: Byte-identical file write skipping; pure timestamp checks for shortcut/autostart sync without spawning PowerShell; skeleton loading in Settings panel.
 
-### 0.7.7 iteration
-
-- Fixed slow quit-to-reopen behavior by closing known desktop-window PIDs directly and skipping unnecessary WMI scans for a normal single-node shutdown.
-- Fixed repeated shortcut/tray clicks starting competing PowerShell and Node launch flows.
-- Added tray **Restart**, which rebuilds the Harness service and desktop window while preserving the tray and auto-start configuration.
+### 0.7.8 / 0.7.7 iteration
 
 ## 📦 Installation
 
@@ -77,7 +76,7 @@ Then **restart the running Web profile**:
 
 - A 🐋 whale tray icon appears in the notification area;
 - A new **Desktop** section shows up in Settings;
-- Once auto-start is enabled, the logon task opens the desktop window with the boot page within seconds (no console flash).
+- Once auto-start is enabled, the logon task opens the selected client with the boot page within seconds (no console flash).
 
 ### Option 2: Install from a source checkout
 
@@ -118,7 +117,7 @@ Open **Settings → Desktop**:
 | Panel | What it does |
 | --- | --- |
 | Status | Live state of the harness service, tray, desktop window, desktop shortcut, auto-start, terminal |
-| Auto-start | Enable/disable login auto-start (Task Scheduler logon trigger, Run-key fallback); when enabled, login starts the service in seconds and opens the desktop window with the boot page directly |
+| Auto-start | Enable/disable login auto-start (Task Scheduler logon trigger, Run-key fallback); select **Auto-start Mode** (desktop app window or web browser, strictly opens one client) |
 | Actions | **Switch to Desktop / Switch to Web** (labeled by the current mode), start/quit tray, create desktop shortcut, show/hide terminal |
 
 The **Last open** line reports the previous launch: readiness time (e.g. `ready in 1.2s`) and window mode (`standalone window` / `default browser`), or the failure reason — check this first when something feels slow.
@@ -129,9 +128,10 @@ The **Last open** line reports the previous launch: readiness time (e.g. `ready 
 | --- | --- |
 | Companion directory | `%LOCALAPPDATA%\dsh-desktop\` (auto-migrated from v0.1's `$DSH_HOME\desktop`) |
 | `dsh-tray.ps1` | Core tray/launcher script (window layout, single instance, readiness polling, quit signal) |
-| `harness.json` | Exact CLI entry of the running installation: node, DSH_HOME, origin, port |
-| `state.json` | `showTerminal` / `autoStart` state |
+| `harness.json` | Exact CLI entry of the running installation: node, DSH_HOME, origin, actual bound port |
+| `state.json` | `showTerminal` / `autoStart` / `autoStartMode` state |
 | `open-state.json` | Last-open diagnostics (readiness time, window mode) |
+| `launch-failures.json` | Circuit breaker diagnostics (only generated when auto-relaunch trips after 3 failed attempts) |
 | Boot page | `boot.html` — the black-whale-on-white page shown in the desktop window until the service is ready, then auto-redirects to the UI |
 | Auto-start method | Task Scheduler logon trigger (the `DSHDesktop` task, no admin rights); `HKCU\...\Run` is only the fallback when registration fails; the active method is recorded in `%LOCALAPPDATA%\dsh-desktop\autostart-method.json` (`task` / `runkey`) |
 | Desktop/web state detection | Dual-channel: recorded window PID (primary) + WMI command-line match (fallback) — reliable even without WMI |

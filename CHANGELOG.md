@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.1 — 2026-09-12
+
+- **Shortcut launch now starts the service first**:
+  - `dsh-open.vbs` is now a generated fast launcher (`DSH_OPEN_LAUNCHER_V2`): it probes the origin and the fresh `harness-launch.tmp` mark, starts the node service directly via wscript when needed (the same fast path the logon launcher already used), and only then runs the hidden PowerShell `-Open` companion for the desktop window. Node cold-start is no longer serialized behind PowerShell CLR initialization and window preparation.
+  - `-ShortcutOk` verifies the `DSH_OPEN_LAUNCHER_V2` marker so legacy launchers are automatically regenerated upon update.
+- **Port auto-correction from bound web server**:
+  - `harness.json` records the actual bound web server port (`webServer.port`) instead of blindly trusting `process.argv` `--port` (which DSH web app may ignore). Prevents the tray from getting stuck querying an unbound port.
+  - `detectOrigin()` uses the previous `harness.json` port as fallback to prevent file flapping between boots.
+- **Artifact freshness tracking**:
+  - `syncShortcut` and `syncAutoStart` now verify launcher freshness against `harness.json` modification time, ensuring new CLI entries/ports are propagated immediately.
+
+## 0.8.0 — 2026-09-12
+
+- **Fixed duplicate client opening on login**:
+  - Added `--no-open` to the logon auto-start launcher (`dsh-autostart.vbs`), preventing DSH's built-in `openBrowser` from popping up a default browser tab while opening the `--app` desktop window.
+- **New `autoStartMode` setting**:
+  - Added `autoStartMode` (`desktop` | `web`, default `desktop`) in Settings: login auto-start now opens strictly the selected client (dedicated desktop app window or default web browser), never both.
+- **Port safety & relaunch protection**:
+  - Rewrote the launch gate in `Start-Harness`: prevents spawning a second Node instance when an existing Node process is already in cold-start.
+  - Added auto-relaunch circuit breaker in `Ensure-Harness`: trips after 3 consecutive failed launches and records diagnostic information to `%LOCALAPPDATA%\dsh-desktop\launch-failures.json`.
+  - Full-path lifecycle cleanup of `harness-launch.tmp` to prevent stale locks.
+- **Suppressed Google Translate bubble in Chromium app window**:
+  - Automatically sets `translate.enabled: false` in the dedicated profile (`edge-profile\Default\Preferences`) to disable translation popups in Chrome 138+.
+- **Accurate readiness detection**:
+  - `Test-HarnessHttp` rejects 404 responses during startup; `Wait-HarnessToken` waits until the full plugin tree is loaded before switching/opening windows, resolving delayed workspace/conversation loading.
+- **Performance optimizations**:
+  - `installAssets`, `writeState`, and `writeHarnessInfo` now skip byte-identical file writes.
+  - `syncShortcut` and `syncAutoStart` use pure filesystem timestamp checks to eliminate unnecessary PowerShell subprocess spawns during steady-state boots.
+  - Settings panel latency improvements: removed redundant self-HTTP probe, cached aggregated snapshot for 2s, raised slow-path TTL, and added immediate skeleton loading in the UI.
+
 ## 0.7.8 — 2026-09-11
 
 - **Fixed port contention / repeated restarts on boot**:

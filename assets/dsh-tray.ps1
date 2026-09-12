@@ -1,4 +1,4 @@
-﻿# DeepSeek Harness 桌面端 —— 托盘伴侣脚本 v7.6
+﻿# DeepSeek Harness 桌面端 —— 托盘伴侣脚本 v7.7
 # 用法:
 #   dsh-tray.ps1 -Install          创建/更新桌面快捷方式后退出
 #   dsh-tray.ps1 -ShortcutOk       桌面快捷方式存在且指向本脚本 -Open 时退出码 0, 否则 1
@@ -140,6 +140,18 @@
 #   - 降低卡顿: Close-AppWindow 关闭窗口后写回 pid=0 记录而非删除文件, 宿主快速路径
 #     据此直接判定"未运行", 不再每 5 秒冷启动一个 PowerShell -AppWindowActive; 看守
 #     进程常驻轮询从 200ms 放宽到 500ms。
+# v7.7 (快捷方式启动慢):
+#   - 根因: 桌面快捷方式经 dsh-open.vbs 先冷启动 PowerShell (-Open), 而 -Open
+#     先做窗口准备 (再起一个看守 PowerShell / 等 watcher.ready / COM 重建 .lnk),
+#     之后才拉起 node —— node 的最长冷启动被整条链路串行拖后。登录自启动 v7.1
+#     起已经用 wscript 直启 node 绕开了这一层, 快捷方式没有。
+#   - 修复: dsh-open.vbs 改为"快速启动器" (Write-OpenLauncher): 先用 WinHTTP 探活
+#     服务 (任意应答即视为已运行), 并检查 harness-launch.tmp 是否新鲜; 需要时直接
+#     以 wscript 隐藏拉起 node (与登录启动器同一条路径), 再隐藏拉起 PowerShell
+#     -Open 伴侣负责窗口/自愈/托盘。快捷方式、托盘菜单、托盘双击共用它。
+#   - Wait-HarnessToken 改为只轮询日志 (Get-HarnessAuthUrlRaw), 不再每 500ms
+#     跑一次 WMI 进程枚举。
+#   - -ShortcutOk 增加启动器版本标记校验: 旧版 dsh-open.vbs 会被自动重建。
 # 注意: 本文件必须以 UTF-8 带 BOM 保存, 否则 Windows PowerShell 5.1 会按 ANSI 读取,
 # 中文注释/字符串乱码会导致脚本解析失败。
 param(
@@ -153,6 +165,7 @@ param(
   [switch]$AutoStartOn,
   [switch]$AutoStartOff,
   [switch]$AutoStart,
+  [switch]$AutoStartWeb,
   [switch]$AutoStartDiag,
   [switch]$ShowTerminal,
   [switch]$HideTerminal,
@@ -212,18 +225,66 @@ if ($null -ne $harnessJson) {
 }
 
 # 用户偏好: state.json (新), 缺失时回退 terminal.json (旧版) 的 showTerminal
-$state = @{ showTerminal = $false }
+# autoStartMode: 登录自启动打开哪一端 —— 'desktop' (独立桌面窗口) | 'web' (默认浏览器)。
+# 任何非法/缺失值都回退 'desktop', 与旧版行为完全一致 (向后兼容:
+# 旧版 dsh-tray.ps1 读到多余的 autoStartMode 字段会直接忽略, 不会报错)。
+$state = @{ showTerminal = $false; autoStartMode = 'desktop' }
 try {
   if (Test-Path $stateFile) {
     $parsed = Get-Content -Path $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($null -ne $parsed) {
       if ($null -ne $parsed.showTerminal) { $state.showTerminal = [bool]$parsed.showTerminal }
+      if ($null -ne $parsed.autoStartMode) {
+        $modeRaw = ([string]$parsed.autoStartMode).Trim().ToLowerInvariant()
+        if ($modeRaw -eq 'web' -or $modeRaw -eq 'desktop') { $state.autoStartMode = $modeRaw }
+      }
     }
   } elseif (Test-Path $legacyTerminalFile) {
     $parsed = Get-Content -Path $legacyTerminalFile -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($null -ne $parsed -and $null -ne $parsed.showTerminal) { $state.showTerminal = [bool]$parsed.showTerminal }
   }
 } catch { }
+
+# ---------- 防抢端口 / 防死循环 运行时护栏 ----------
+# --no-open 必须同时作用于三条拉起服务的路径 (Start-Harness 的 node 直连与 npx 兜底,
+# 以及登录自启动启动器 dsh-autostart.vbs)。漏掉任何一条, DSH web-app 都会在服务就绪
+# 后自己弹一个默认浏览器 (openBrowser 默认 true), 与桌面窗口重复。
+$pwNoOpen = '--no-open'
+# 登录自启动启动器 (dsh-autostart.vbs) 在拉起 node 之前写下"我要开始了"的时间戳。
+# -AutoStart 靠它的新鲜度判断"启动器正在拉起服务", 由此取代旧代码的全系统
+# Get-Process node —— 只要机器上有任意一个 node.exe, 旧判定就会误认为"已在拉起",
+# 从而要么跳过兜底 (启动器真失败时服务永远起不来), 要么在启动器尚未生效时抢着
+# 再拉一个 (两个 node 撞 EADDRINUSE, 日志里的实证)。
+# 注意: 绝不能用 WScript.Shell.Exec 去拿 node 的 PID —— Exec 会阻塞到 node 退出,
+# 而 node 正是常驻服务进程, 启动器将永远走不到写 PID 那一步 (实测确认)。
+$launchMarkFile = Join-Path $scriptDir 'harness-launch.tmp'
+$launchMarkFreshSec = 300
+# 启动拉起的失败计数 (熔断用): 同一会话内连续失败到阈值即停止重拉, 只留诊断。
+$launchFailuresFile = Join-Path $scriptDir 'launch-failures.json'
+$maxLaunchFailures = 3
+
+# 启动标记文件的新鲜度 (秒); 读不到/无法解析时返回一个很大的值 (视为不新鲜)。
+function Get-LaunchMarkAgeSec {
+  try {
+    if (-not (Test-Path $launchMarkFile)) { return [int]::MaxValue }
+    $raw = Get-Content -Path $launchMarkFile -Raw -ErrorAction SilentlyContinue
+    if ($null -ne $raw -and $raw.Trim().Length -gt 0) {
+      $ts = [datetime]::MinValue
+      if ([datetime]::TryParse($raw.Trim(), [ref]$ts)) {
+        return [int]((Get-Date) - $ts).TotalSeconds
+      }
+    }
+    # 旧版/空内容: 退回文件自身的写入时间
+    return [int]((Get-Date) - (Get-Item $launchMarkFile).LastWriteTime).TotalSeconds
+  } catch { return [int]::MaxValue }
+}
+
+# 启动器是否"极可能正在拉起服务": 服务已就绪 (端口在听) → 是; 启动标记新鲜 → 是。
+# 用于 -AutoStart 的补位判断: 宁可多等几秒, 也绝不并发拉第二个 node。
+function Test-LaunchLikelyInProgress {
+  if (Test-HarnessTcp) { return $true }
+  return ((Get-LaunchMarkAgeSec) -lt $launchMarkFreshSec)
+}
 
 # ---------- C# 原生辅助源码 (懒加载: 仅需要的模式才编译, 开机路径不编译) ----------
 $DSHNativeSource = @'
@@ -434,7 +495,9 @@ function Test-HarnessHttp {
       $code = [int]$_.Exception.Response.StatusCode
       $_.Exception.Response.Close()
     }
-    return ($code -ge 200 -and $code -lt 500)
+    # 404 = webserver 已监听, 但该路由还没有注册 (启动初期 fallback 一律 404) ——
+    # 不能算就绪。真正的页面 (2xx/3xx) 与认证栅栏 (401/403) 才算。
+    return (($code -ge 200 -and $code -lt 400) -or $code -eq 401 -or $code -eq 403)
   } catch { return $false }
 }
 
@@ -475,7 +538,49 @@ function Get-NodeExe {
 
 # 启动 Harness 服务。优先直连 node 启动 (无需 npx, 秒级就绪);
 # 兜底用 npx (先 --no-install, 再普通 npx)。
+#
+# 端口闸门 (关键防复发护栏): 函数入口先探端口, 已监听即直接返回, 绝不 Start-Process。
+# 这样"任何调用路径"都不可能产生第二个 node 实例 —— 包括托盘/快捷方式/设置页按钮/
+# 登录自启动/自愈重拉同时触发的竞态。唯一的例外是 -Force, 只给"已确认观察到垂死
+# 实例并确认它已退出、端口应当已释放"的路径使用。
 function Start-Harness {
+  param([switch]$Force)
+  if (-not $Force) {
+    if (Test-HarnessTcp) {
+      # 端口已被占用: 别的实例 (托盘自愈/启动器/命令行启动的实例/用户自己开的) 已经
+      # 拥有服务。再拉一个只会撞 EADDRINUSE 并让服务树加载失败 —— 直接让出。
+      return $true
+    }
+    # 端口未监听: 先找出"可能正在冷启动的 harness 实例", 找到就只等它, 绝不并发
+    # 第二个 node。两个实例同时加载体积巨大的 profile 会把冷启动拖慢数倍, 而且
+    # 后启动的那个最终会撞 EADDRINUSE 崩溃 (旧日志里的实证)。
+    #   - 任何已在运行的 harness node → 按 PID 判活等待 (快速 Win32, 不碰 WMI);
+    #   - 没有 harness node 但启动器标记新鲜 → 留 8 秒观察窗等 node 出现
+    #     (标记与 node 进程出现之间只有毫秒级间隙, 但开机初期 WMI 可能较慢);
+    #   - 以上都没有 → 立即拉起 (不再为陈旧标记白等, 旧代码固定等 30 秒)。
+    # 等待上限 = 标记新鲜度 (5 分钟): 超时仍未监听就视为卡死, 落回正常拉起。
+    $launchT0 = [Environment]::TickCount
+    $harnessPid = 0
+    $markFresh = (Get-LaunchMarkAgeSec) -lt $launchMarkFreshSec
+    while ($true) {
+      if ($harnessPid -gt 0) {
+        if ($null -eq (Get-Process -Id $harnessPid -ErrorAction SilentlyContinue)) { break }
+      } else {
+        $running = Get-HarnessNode
+        if ($null -ne $running) {
+          $harnessPid = [int]$running.ProcessId
+        } elseif (-not ($markFresh -and ([Environment]::TickCount - $launchT0) -lt 8000)) {
+          break
+        }
+      }
+      if (Test-HarnessTcp) { return $true }
+      if ([Environment]::TickCount - $launchT0 -gt ($launchMarkFreshSec * 1000)) { break }
+      Start-Sleep -Milliseconds 500
+    }
+    if (Test-HarnessTcp) { return $true }
+  }
+  # 决定自行拉起: 启动器的标记已失去意义, 清掉避免后续调用重复等待。
+  Remove-Item $launchMarkFile -Force -ErrorAction SilentlyContinue
   $entry = Find-DshEntry
   $nodeExe = Get-NodeExe
   $workDir = $harnessCwd
@@ -483,7 +588,7 @@ function Start-Harness {
   $show = $state.showTerminal
   if ($null -ne $entry -and (Test-Path $entry) -and $null -ne $nodeExe -and (Test-Path $nodeExe)) {
     # --no-open: 由托盘/快捷方式负责打开桌面窗口, 避免 Harness 自己再弹一个默认浏览器
-    $argLine = '"' + $entry + '" web --no-open'
+    $argLine = '"' + $entry + '" web ' + $pwNoOpen
     if ($null -ne $webArgs -and $webArgs.Count -gt 0) { $argLine += ' ' + (($webArgs | Where-Object { $_ }) -join ' ') }
     $oldDshHome = $env:DSH_HOME
     try {
@@ -502,7 +607,7 @@ function Start-Harness {
       if ($null -eq $oldDshHome) { Remove-Item Env:DSH_HOME -ErrorAction SilentlyContinue } else { $env:DSH_HOME = $oldDshHome }
     }
   }
-  $npxCmd = 'title DeepSeek Harness && npx --no-install @deepseek-ai/dsh web --no-open'
+  $npxCmd = 'title DeepSeek Harness && npx --no-install @deepseek-ai/dsh web ' + $pwNoOpen
   try {
     if ($show) {
       Start-Process -FilePath 'cmd.exe' -ArgumentList @('/k', $npxCmd) -WorkingDirectory $workDir
@@ -517,6 +622,19 @@ function Start-Harness {
 # 读取当前 Harness 进程的认证 URL (CLI 启动时打印到日志的 ?token=... 地址)。
 # 仅当日志比进程创建时间新时才采用, 避免复用上一个进程的失效 token;
 # 命令行/手动启动的实例没有本日志, 返回 $null (调用方回退 origin + cookie)。
+# 只读日志里的认证 URL, 不做进程新鲜度校验 —— 供 Wait-HarnessToken 高频轮询使用,
+# 避免每次轮询都跑一次 WMI (Get-HarnessNode 内部是 Win32_Process 枚举)。
+function Get-HarnessAuthUrlRaw {
+  try {
+    if (-not (Test-Path $harnessLogFile)) { return $null }
+    $text = Get-Content -Path $harnessLogFile -Raw -ErrorAction SilentlyContinue
+    if (-not $text) { return $null }
+    $urlMatches = [regex]::Matches($text, 'http://127\.0\.0\.1:' + [string]$port + '/\?token=[A-Za-z0-9_\-]+')
+    if ($urlMatches.Count -eq 0) { return $null }
+    return $urlMatches[$urlMatches.Count - 1].Value
+  } catch { return $null }
+}
+
 function Get-HarnessAuthUrl {
   try {
     if (-not (Test-Path $harnessLogFile)) { return $null }
@@ -527,12 +645,42 @@ function Get-HarnessAuthUrl {
     $created = $null
     try { $created = [datetime]$node.CreationDate } catch { $created = $null }
     if ($null -ne $created -and $logItem.LastWriteTime -lt $created) { return $null }
-    $text = Get-Content -Path $harnessLogFile -Raw -ErrorAction SilentlyContinue
-    if (-not $text) { return $null }
-    $urlMatches = [regex]::Matches($text, 'http://127\.0\.0\.1:' + [string]$port + '/\?token=[A-Za-z0-9_\-]+')
-    if ($urlMatches.Count -eq 0) { return $null }
-    return $urlMatches[$urlMatches.Count - 1].Value
+    return Get-HarnessAuthUrlRaw
   } catch { return $null }
+}
+
+# 当前 harness 实例是否在写 harness-console.log (即由托盘 -RedirectStandardOutput
+# 或登录启动器的 cmd 重定向启动)。判定依据是日志文件不早于进程创建时间 (允许
+# 十几秒误差), 这样上一会话的陈旧日志不会被误认为"本次会写出 token"。
+function Test-HarnessLogCurrent {
+  try {
+    $logItem = Get-Item $harnessLogFile -ErrorAction SilentlyContinue
+    if ($null -eq $logItem) { return $false }
+    $node = Get-HarnessNode
+    if ($null -eq $node) { return $false }
+    $created = [datetime]$node.CreationDate
+    return ($logItem.LastWriteTime -ge $created) -or ($logItem.CreationTime -ge $created.AddSeconds(-15))
+  } catch { return $false }
+}
+
+# 等待 CLI 打印认证 URL (?token=...)。web-app 在**整个插件树加载完成后**才打印
+# 这一行 (dsh-web-app: connectionCtx.get("loader").await())。只探到 HTTP 就打开
+# 窗口, 前端会在插件树尚未就绪时对 /api 拿到 404 并指数退避重试 —— 表现就是
+# "窗口出来了, 但左侧会话要等十几秒才加载出来"。所以只要确认本次实例会写日志,
+# 就等 URL 落盘再开窗口。非重定向实例 (手动 CLI) 没有本日志, 直接返回 $null,
+# 行为与以前一致。
+function Wait-HarnessToken([int]$timeoutSec = 240) {
+  if (-not (Test-HarnessLogCurrent)) { return $null }
+  $deadline = [Environment]::TickCount + ($timeoutSec * 1000)
+  while ([Environment]::TickCount -lt $deadline) {
+    # 只读日志/探 HTTP (v7.7): 不再每轮 Get-HarnessAuthUrl -> Get-HarnessNode
+    # (一次 WMI 枚举), 启动等待期间的开销从"每 500ms 一次 WMI"降为纯文件读取。
+    $url = Get-HarnessAuthUrlRaw
+    if ($url) { return $url }
+    if (-not (Test-HarnessHttp)) { return $null }  # 实例挂了: 让调用方回主循环自愈
+    Start-Sleep -Milliseconds 500
+  }
+  return $null
 }
 
 # 正在运行的 Harness node 进程 (含正在启动中的实例)
@@ -592,7 +740,12 @@ function Get-HarnessRoot {
 # 发现进程但端口未监听时, 观察该进程: 端口起来 → 继续等待就绪; 进程退出
 # (残留已死) → 立即重新拉起; 观察 20 秒端口仍无且进程还活着 (卡死) → 强杀重启。
 function Ensure-Harness {
-  if (Test-HarnessHttp) { return $true }
+  if (Test-HarnessHttp) {
+    # 服务已应答也要确认插件树加载完成 (token 落盘), 否则此时打开窗口, 前端
+    # RPC 仍会在插件树就绪前 404 退避重试 (左侧会话加载慢)。
+    [void](Wait-HarnessToken)
+    if (Test-HarnessHttp) { return $true }
+  }
   $launcher = New-Object System.Threading.Mutex($false, $launchMutexName)
   $owned = $false
   # 上一个启动器进程可能被终止而留下 abandoned 互斥锁: 此时应视为我们获得了锁
@@ -612,7 +765,7 @@ function Ensure-Harness {
             if ($null -eq (Get-Process -Id $observePid -ErrorAction SilentlyContinue)) {
               # 被观察的进程已退出: 等 300ms 后重新拉起
               Start-Sleep -Milliseconds 300
-              [void](Start-Harness)
+              [void](Start-Harness -Force)
               break
             }
             Start-Sleep -Milliseconds 300
@@ -630,18 +783,25 @@ function Ensure-Harness {
   #   - 无进程且端口未监听 (之前拉起的实例被并发退出误杀/自身崩溃) → 重新拉起;
   #   - 有进程或端口在监听但 HTTP 未就绪 → 只等待, 不杀进程 (冷启动可能耗时
   #     数分钟, 尤其是命令行启动的实例; 强杀会造成"抢占端口/重新连接报错")。
+  # 熔断 (v7.7): 同一会话内连续 N 次"无进程无端口"就停止重拉。服务若处于
+  # "启动即崩"状态 (插件报错/profile 构建失败/版本升级后参数变化), 旧版本会
+  # 每 15 秒拉起一次、崩一次, 6 分钟重拉二十多次 —— 表现为"一直重启/报错"。
+  # 现在改为: 拉起到第 $maxLaunchFailures 次仍失败就放弃并写诊断, 绝不进死循环。
+  $launchFailures = 0
   $waitT0 = [Environment]::TickCount
   for ($i = 0; $i -lt 720; $i++) {
     Start-Sleep -Milliseconds 500
     if (Test-HarnessHttp) {
-      # 刚由本脚本拉起时, CLI 打印的认证 URL 可能比监听就绪晚几毫秒才落盘;
-      # 短暂等待它出现, 保证 Open-HarnessWindow 能用 ?token=... 打开窗口。
-      for ($k = 0; $k -lt 25; $k++) {
-        if (-not (Test-Path $harnessLogFile)) { break }
-        $rawLog = Get-Content -Path $harnessLogFile -Raw -ErrorAction SilentlyContinue
-        if ($rawLog -and $rawLog -match '\?token=') { break }
-        Start-Sleep -Milliseconds 200
-      }
+      # 等到认证 URL 落盘才算真正就绪: 它由 web-app 在插件树全部加载完成后打印。
+      # 提前放行会让窗口里的前端 RPC 在插件树未就绪时 404 退避重试 (左侧会话
+      # 十几秒才加载出来)。非重定向实例没有日志, 等待函数会立即返回。
+      [void](Wait-HarnessToken)
+      # 等待期间实例可能已崩溃/重启: 回到主循环, 由自愈逻辑接手。
+      if (-not (Test-HarnessHttp)) { $waitT0 = [Environment]::TickCount; continue }
+      $launchFailures = 0
+      Remove-Item $launchFailuresFile -Force -ErrorAction SilentlyContinue
+      # 服务已就绪: 登录启动器标记的使命结束, 清掉避免后续快捷方式打开重复等待。
+      Remove-Item $launchMarkFile -Force -ErrorAction SilentlyContinue
       return $true
     }
     if ([Environment]::TickCount - $waitT0 -lt 15000) { continue }
@@ -649,12 +809,28 @@ function Ensure-Harness {
     $tcpUp = Test-HarnessTcp
     $running = Get-HarnessNode
     if (-not $tcpUp -and $null -eq $running) {
+      if ($launchFailures -ge $maxLaunchFailures) {
+        # 熔断: 连拉起都失败, 再拉只会刷屏并可能撞上正在退出的旧实例
+        try {
+          @{
+            at = (Get-Date).ToString('o')
+            failures = $launchFailures
+            reason = 'harness did not reach listening state after repeated launches; auto-relaunch stopped (circuit breaker)'
+            entry = Find-DshEntry
+            node = Get-NodeExe
+            log = $harnessLogFile
+          } | ConvertTo-Json -Compress | Set-Content -Path $launchFailuresFile -Encoding Ascii
+        } catch { }
+        return $false
+      }
+      $launchFailures++
       # 没有进程也没有端口: 重新拉起 (启动互斥锁防并发双启)
       $relauncher = New-Object System.Threading.Mutex($false, $launchMutexName)
       $ownedRel = $false
       try { $ownedRel = $relauncher.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ownedRel = $true } catch { $ownedRel = $false }
       if ($ownedRel) {
         try {
+          # 只有在"端口未监听 且 没有任何 harness node 进程"时才允许再拉一个
           if (-not (Test-HarnessTcp) -and $null -eq (Get-HarnessNode)) { [void](Start-Harness) }
         } finally {
           try { $relauncher.ReleaseMutex() } catch { }
@@ -1148,6 +1324,56 @@ function Start-WatchAppWindow {
   }
 }
 
+# Chrome 138+ 移除了 --disable-features=Translate 对应的 base::Feature (未知特性名
+# 被静默忽略), Chrome 152 实测仍会弹翻译气泡。目前唯一生效的开关是 profile 偏好
+# translate.enabled=false (components/translate: kOfferTranslateEnabled)。桌面窗口
+# 使用独立 profile, 所以启动前把它写进 Default\Preferences; 只影响这个专用
+# profile, 不碰用户日常浏览器的设置。用 node 做真正的 JSON 读写 (tmp+rename),
+# 避免文本替换损坏这个由 Chrome 维护的 JSON。
+function Disable-AppWindowTranslate {
+  try {
+    # 上一个窗口进程可能还在退出, 而 Chrome 会在退出时重写 Preferences ——
+    # 我们的修改会被它最后的写入覆盖。等记录里的 PID 真正退出再写 (最多 8 秒)。
+    $rec = Read-AppWindowRecord
+    if ($null -ne $rec) {
+      $deadline = [Environment]::TickCount + 8000
+      while ([Environment]::TickCount -lt $deadline) {
+        if ($null -eq (Get-Process -Id ([int]$rec.pid) -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 300
+      }
+    }
+    $prefFile = Join-Path (Join-Path (Join-Path $scriptDir 'edge-profile') 'Default') 'Preferences'
+    $nodeExe = Get-NodeExe
+    if ($null -eq $nodeExe -or -not (Test-Path $nodeExe)) { return }
+    # 注意: JS 里只用单引号 —— PowerShell 5.1 把带双引号的参数传给原生 exe 时
+    # 会剥掉引号 (实测), 用双引号会直接语法错误, 偏好永远写不进去。
+    $js = @'
+const fs = require('fs');
+const path = require('path');
+try {
+  const file = process.env.DSH_PREF_FILE;
+  let prefs = {};
+  try { prefs = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')); } catch {}
+  if (prefs === null || typeof prefs !== 'object') prefs = {};
+  const translate = (prefs.translate !== null && typeof prefs.translate === 'object') ? prefs.translate : {};
+  if (translate.enabled === false) process.exit(0);
+  prefs.translate = Object.assign({}, translate, { enabled: false });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.dshd.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(prefs));
+  fs.renameSync(tmp, file);
+} catch {}
+'@
+    $oldPref = $env:DSH_PREF_FILE
+    try {
+      $env:DSH_PREF_FILE = $prefFile
+      & $nodeExe -e $js 2>$null | Out-Null
+    } finally {
+      if ($null -eq $oldPref) { Remove-Item Env:DSH_PREF_FILE -ErrorAction SilentlyContinue } else { $env:DSH_PREF_FILE = $oldPref }
+    }
+  } catch { }
+}
+
 # 返回打开方式: app / app-existing / default / none
 # 默认固定以独立桌面窗口打开: 主屏比例 1352:972 居中 (最小 960×690 DIP),
 # 使用独立配置目录 (--user-data-dir): 应用窗口进程就是窗口所有者, 不受本机
@@ -1185,6 +1411,8 @@ function Open-HarnessWindow {
       # 从网页端切换到桌面端: 先通知所有已打开的 Harness 页面自行关闭 (浏览器标签页/窗口)
       [void](Send-QuitSignal)
     }
+    # 桌面窗口启动前: 关掉独立 profile 的翻译气泡 (见 Disable-AppWindowTranslate)
+    Disable-AppWindowTranslate
     $browser = Find-AppBrowser
     if ($browser) {
       $layout = Get-AppWindowLayout
@@ -1202,12 +1430,18 @@ function Open-HarnessWindow {
         $authUrl = Get-HarnessAuthUrl
         if ($authUrl) { $target = $authUrl }
       }
+      # --disable-features=Translate: 对 Chrome <138 有效; 138+ 已移除该特性
+      # (未知特性名被静默忽略), 现在真正生效的是 profile 偏好
+      # translate.enabled=false —— 见 Disable-AppWindowTranslate。
+      # 页面是 <html lang="en"> 但内容以中文为主, 独立 profile 打开时旧版 Chrome
+      # 会弹 "Google Translate" 气泡; 两个开关一起上, 新旧版本都不会再出现。
       $appArgs = '--app=' + $target +
                  ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
                  ' --window-position=' + $layout.posDip.X + ',' + $layout.posDip.Y +
                  ' --user-data-dir="' + $profileDir + '"' +
                  ' --app-user-model-id=DSHDesktopApp' +
-                 ' --no-first-run --no-default-browser-check'
+                 ' --no-first-run --no-default-browser-check' +
+                 ' --disable-features=Translate,TranslateUI'
       if (-not $Boot) { $appArgs += ' --start-minimized' }
       # 启动页窗口需要被 DevTools 协议原地导航到认证页 (浏览器级导航才能种下
       # SameSite=Strict 认证 cookie, 且不会新开窗口)。port=0 让浏览器自己挑
@@ -1323,12 +1557,14 @@ function Retarget-HarnessWindow {
   if (-not $target) { $target = $origin }
   $layout = Get-AppWindowLayout
   $profileDir = Join-Path $scriptDir 'edge-profile'
+  # --disable-features=Translate: 同 Open-HarnessWindow, 关闭 Chrome 内置翻译气泡
   $appArgs = '--app=' + $target +
              ' --window-size=' + $layout.sizeDip.Width + ',' + $layout.sizeDip.Height +
              ' --window-position=' + $layout.posDip.X + ',' + $layout.posDip.Y +
              ' --user-data-dir="' + $profileDir + '"' +
              ' --app-user-model-id=DSHDesktopApp' +
-             ' --no-first-run --no-default-browser-check'
+             ' --no-first-run --no-default-browser-check' +
+             ' --disable-features=Translate,TranslateUI'
   $appLnk = Update-AppWindowShortcut $browser $appArgs
   if ($appLnk -and (Test-Path $appLnk)) {
     try { Start-Process -FilePath $appLnk | Out-Null; return $true } catch { }
@@ -1366,6 +1602,16 @@ function Close-BootWindow {
 # 服务就绪后把启动页窗口切换到 Harness 页面: 优先 DevTools 原地导航 (单窗口),
 # DevTools 不可用时回退"新开认证窗口 + 关闭启动页"。
 function Switch-BootWindowToHarness {
+  # 服务必须仍在应答才导航: 就绪判定与导航之间可能隔了几百毫秒 (调用方先
+  # Test-HarnessHttp 再调用本函数), 期间实例若崩溃/重启, 启动页窗口会被导航到
+  # 一个拒绝连接的端口 (Chromium ERR_CONNECTION_REFUSED), 只能手动刷新。
+  if (-not (Test-HarnessHttp)) {
+    for ($i = 0; $i -lt 20; $i++) {
+      Start-Sleep -Milliseconds 500
+      if (Test-HarnessHttp) { break }
+    }
+    if (-not (Test-HarnessHttp)) { return 'not-ready' }
+  }
   $target = Get-HarnessAuthUrl
   if (-not $target) { $target = $origin }
   if (Invoke-CdpNavigateBootWindow $target) { return 'cdp' }
@@ -1432,6 +1678,9 @@ function Set-TerminalWindow([int]$showCode) {
 # ---------- 结束 Harness ----------
 
 function Stop-Harness {
+  # 退出后不应再有任何"实例正在冷启动"; 清掉启动器标记, 否则它会留在原地
+  # (最多 5 分钟) 让下一次 -Open / Start-Harness 白等。
+  Remove-Item $launchMarkFile -Force -ErrorAction SilentlyContinue
   $found = $false
   # 年龄护栏 (v7.3): 只结束"退出开始前"就存在的进程。退出期间并发重开
   # (-Open) 启动的新实例绝不能被快照误杀 —— WMI 扫描可能把刚启动的新实例
@@ -1607,13 +1856,27 @@ function Ensure-TrayRunning {
   }
 }
 
+# 打开/激活桌面窗口 (托盘菜单、双击、左键单击共用):
+# 有快速启动器 dsh-open.vbs 时经 wscript 走"服务先启动"的快路径 (v7.7);
+# 启动器缺失时退回直接拉起 PowerShell -Open (旧行为, 功能不受影响)。
+function Start-OpenFlow {
+  if (Test-Path $openVbsFile) {
+    try {
+      Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList ('"' + $openVbsFile + '"')
+      return
+    } catch { }
+  }
+  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+}
+
 function Install-Shortcut {
   Ensure-DSHShell
   $desktop = [Environment]::GetFolderPath('Desktop')
   $lnkPath = Join-Path $desktop $shortcutName
-  # 生成隐藏打开启动器 (wscript + sh.Run(..., 0, False)): 快捷方式经它拉起 -Open,
-  # 控制台从头到尾不出现。目标改成 wscript.exe, 参数指向该 VBS。
-  [void](Write-HiddenRunner $openVbsFile ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $scriptDir + '\dsh-tray.ps1" -Open'))
+  # 生成快速打开启动器 (wscript): 需要时先隐藏直启 node 服务, 再隐藏拉起
+  # PowerShell -Open 伴侣负责窗口/自愈/托盘。控制台从头到尾不出现, 且 node 的
+  # 冷启动不再排在 PowerShell 冷启动 + 窗口准备之后 (v7.7)。目标改为 wscript.exe。
+  [void](Write-OpenLauncher)
   $shell = New-Object -ComObject WScript.Shell
   $sc = $shell.CreateShortcut($lnkPath)
   $sc.TargetPath = Join-Path $env:SystemRoot 'System32\wscript.exe'
@@ -1674,7 +1937,8 @@ function Test-DSHDesktopTask {
 # 实测开机争抢下 PowerShell 5.1 冷启动可达 20~30 秒, 让服务等它是最浪费的。
 # 启动器内嵌当前 harness.json 的 node/入口/DSH_HOME/cwd, 每次 Set-AutoStart
 # 都会重新生成 (入口随 dsh 更新而变化); 生成失败时任务只剩 PowerShell 动作。
-$launchMarkFile = Join-Path $scriptDir 'harness-launch.tmp'
+# dsh-autostart.vbs 的路径 (仅由 Write-AutoStartLauncher 使用; 标记文件的路径
+# 已在文件头部定义, 因为它被 Test-LaunchLikelyInProgress 等函数提前引用)。
 $vbsFile = Join-Path $scriptDir 'dsh-autostart.vbs'
 # 隐藏启动器 VBS: 开机任务动作②用 companion (隐藏拉起 PowerShell -AutoStart);
 # 桌面快捷方式用 open (隐藏拉起 PowerShell -Open)。两者都经 wscript.exe 执行,
@@ -1705,24 +1969,140 @@ function Write-AutoStartLauncher {
     $nodeExe = Get-NodeExe
     $entry = Find-DshEntry
     if ($null -eq $nodeExe -or $null -eq $entry -or -not (Test-Path $entry)) { return $false }
-    $nodeCmd = '"' + $nodeExe + '" "' + $entry + '" web'
+    # --no-open 是登录自启动的关键: DSH web-app 的 openBrowser 默认为 true,
+    # 服务就绪后它自己会弹一个默认浏览器普通标签页。这里不传 --no-open 就会
+    # 与 -AutoStart 打开的独立桌面窗口同时出现 —— "开机开了两个 DeepSeek Harness"
+    # 的真正根因 (Start-Harness 早在批次①就补上了 --no-open, 这个后加的启动器漏了)。
+    $nodeCmd = '"' + $nodeExe + '" "' + $entry + '" web ' + $pwNoOpen
     if ($null -ne $webArgs -and $webArgs.Count -gt 0) { $nodeCmd += ' ' + (($webArgs | Where-Object { $_ }) -join ' ') }
     $workDir = $harnessCwd
     if (-not (Test-Path $workDir)) { $workDir = $HOME }
+    # 把 node 的输出重定向到与托盘启动相同的日志文件: 登录路径也能拿到 CLI 在
+    # "插件树加载完成"后打印的 ?token= 认证 URL。启动页窗口/前端会等这个 URL 出现
+    # 再切换, 从而避免插件树未就绪时前端 RPC 404 退避重试 (左侧会话加载慢)。
+    # cmd /c 引号规则: 命令本身以引号开头时整体再包一层引号, 且只包一层 ——
+    # 正确形式是 cmd /c ""<node> <entry> ... > "log" 2> "err"" (开头恰好两个引号)。
+    $runCmd = 'cmd /c "' + $nodeCmd + ' > "' + $harnessLogFile + '" 2> "' + $harnessErrFile + '""'
     $vbs = @"
 ' DeepSeek Harness login auto-start launcher (generated by dsh-tray.ps1 Set-AutoStart).
 ' Runs as the FIRST task action via wscript.exe: starts the harness service
 ' directly (no PowerShell cold start at peak logon load). The SECOND task
 ' action starts the PowerShell companion (desktop window + tray).
+' --no-open is mandatory here: without it the web app opens a default-browser
+' tab of its own, duplicating the desktop window at every login.
+' The cmd redirection matters too: it writes harness-console.log/err.log, which
+' is where the companion reads the ?token= URL printed after the plugin tree
+' has fully loaded (windows open only when the UI can really talk to the API).
 Set sh = CreateObject("WScript.Shell")
 sh.CurrentDirectory = "$(ConvertTo-VbsLiteral $workDir)"
 sh.Environment("PROCESS")("DSH_HOME") = "$(ConvertTo-VbsLiteral $dshHome)"
 Set fso = CreateObject("Scripting.FileSystemObject")
-fso.CreateTextFile("$(ConvertTo-VbsLiteral $launchMarkFile)", True).Close
-sh.Run "$(ConvertTo-VbsLiteral $nodeCmd)", 0, False
+' 先写"我要开始了"的时间戳, 再拉起服务: 托盘端 -AutoStart / Start-Harness 靠它的
+' 新鲜度判断"服务正在被启动器拉起", 从而只等待、绝不并发再拉一个 node。
+' 绝不使用 sh.Exec: Exec 会阻塞到 node 退出, 而 node 是常驻服务进程。
+Set mf = fso.CreateTextFile("$(ConvertTo-VbsLiteral $launchMarkFile)", True)
+mf.Write Now
+mf.Close
+sh.Run "$(ConvertTo-VbsLiteral $runCmd)", 0, False
 "@
     $vbs | Set-Content -Path $vbsFile -Encoding Unicode
     return (Test-Path $vbsFile)
+  } catch { return $false }
+}
+
+# 桌面快捷方式 / 托盘打开的快速启动器 (v7.7, 标记 DSH_OPEN_LAUNCHER_V2)。
+# 与登录启动器 dsh-autostart.vbs 同一条直启 node 的快路径, 外加两道探活:
+#   1) WinHTTP 探测 origin: 任意 HTTP 应答 (含 401) 说明服务已运行 → 不再拉起;
+#   2) harness-launch.tmp 新鲜 (< $launchMarkFreshSec) → 别的启动器已在拉起
+#      node → 只等待, 不并发第二个实例 (由 -Open 的 Ensure-Harness 接管)。
+# showTerminal=true 时不做预启动: 由 PowerShell 伴侣走"可见终端"的旧路径拉起。
+# 校验兜底: node/入口解析失败时退化为纯隐藏伴侣启动器 (仍带版本标记)。
+function Write-OpenLauncher {
+  try {
+    $marker = 'DSH_OPEN_LAUNCHER_V2'
+    $companionCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $scriptDir + '\dsh-tray.ps1" -Open'
+    $nodeExe = Get-NodeExe
+    $entry = Find-DshEntry
+    $workDir = $harnessCwd
+    if (-not (Test-Path $workDir)) { $workDir = $HOME }
+    if ($null -ne $nodeExe -and (Test-Path $nodeExe) -and $null -ne $entry -and (Test-Path $entry)) {
+      $nodeCmd = '"' + $nodeExe + '" "' + $entry + '" web ' + $pwNoOpen
+      if ($null -ne $webArgs -and $webArgs.Count -gt 0) { $nodeCmd += ' ' + (($webArgs | Where-Object { $_ }) -join ' ') }
+      $runCmd = 'cmd /c "' + $nodeCmd + ' > "' + $harnessLogFile + '" 2> "' + $harnessErrFile + '""'
+      $vbs = @"
+' DeepSeek Harness desktop shortcut launcher (generated by dsh-tray.ps1).
+' Marker: $marker
+' The harness node service starts FIRST (wscript -> cmd, no PowerShell CLR cold
+' start in front of node), then the hidden PowerShell companion (-Open) opens
+' and retargets the desktop window. When the service already answers, or a fresh
+' harness-launch.tmp shows another launcher is starting it, the service start is
+' skipped and only the companion runs. --no-open is mandatory: without it the
+' web app would open a default-browser tab of its own.
+Option Explicit
+Dim sh, fso, up, starting, show, text, http, mf
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = "$(ConvertTo-VbsLiteral $workDir)"
+sh.Environment("PROCESS")("DSH_HOME") = "$(ConvertTo-VbsLiteral $dshHome)"
+Set fso = CreateObject("Scripting.FileSystemObject")
+
+' showTerminal=true means a visible console is wanted: the PowerShell companion
+' owns that start path, so do not pre-start the service hidden here.
+show = False
+On Error Resume Next
+If fso.FileExists("$(ConvertTo-VbsLiteral $stateFile)") Then
+  text = fso.OpenTextFile("$(ConvertTo-VbsLiteral $stateFile)", 1).ReadAll()
+  If InStr(text, """showTerminal"":true") > 0 Then show = True
+ElseIf fso.FileExists("$(ConvertTo-VbsLiteral $legacyTerminalFile)") Then
+  text = fso.OpenTextFile("$(ConvertTo-VbsLiteral $legacyTerminalFile)", 1).ReadAll()
+  If InStr(text, """showTerminal"":true") > 0 Then show = True
+End If
+Err.Clear
+On Error GoTo 0
+
+If Not show Then
+  ' Any HTTP answer (200/302/401/404...) proves the server is listening.
+  up = False
+  On Error Resume Next
+  Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+  http.SetTimeouts 150, 150, 150, 300
+  http.Open "GET", "$(ConvertTo-VbsLiteral $origin)/", False
+  http.Send
+  If Err.Number = 0 Then up = True
+  Err.Clear
+  On Error GoTo 0
+  ' A fresh mark means another launcher already fired node; just wait for it.
+  starting = False
+  On Error Resume Next
+  If fso.FileExists("$(ConvertTo-VbsLiteral $launchMarkFile)") Then
+    starting = (DateDiff("s", fso.GetFile("$(ConvertTo-VbsLiteral $launchMarkFile)").DateLastModified, Now) < $launchMarkFreshSec)
+  End If
+  Err.Clear
+  On Error GoTo 0
+  If Not up And Not starting Then
+    On Error Resume Next
+    Set mf = fso.CreateTextFile("$(ConvertTo-VbsLiteral $launchMarkFile)", True)
+    If Err.Number = 0 Then
+      mf.Write Now
+      mf.Close
+      sh.Run "$(ConvertTo-VbsLiteral $runCmd)", 0, False
+    End If
+    Err.Clear
+    On Error GoTo 0
+  End If
+End If
+
+sh.Run "$(ConvertTo-VbsLiteral $companionCmd)", 0, False
+"@
+      $vbs | Set-Content -Path $openVbsFile -Encoding Unicode
+      return (Test-Path $openVbsFile)
+    }
+    # 解析不到 node/入口: 退化为纯隐藏伴侣启动器 (旧行为), 仍写版本标记,
+    # 避免 -ShortcutOk 每次都判定过期而反复重建。
+    $fallback = "' $marker (fallback: harness.json launch info unavailable)`r`n" +
+                "Set sh = CreateObject(""WScript.Shell"")`r`n" +
+                "sh.Run """ + (ConvertTo-VbsLiteral $companionCmd) + """, 0, False`r`n"
+    $fallback | Set-Content -Path $openVbsFile -Encoding Unicode
+    return (Test-Path $openVbsFile)
   } catch { return $false }
 }
 
@@ -1854,6 +2234,8 @@ function Set-AutoStart {
   # 两者都经 sh.Run(..., 0, False) 以 SW_HIDE 启动, 开机全程无终端闪现。
   [void](Write-AutoStartLauncher)
   [void](Write-HiddenRunner $companionVbsFile ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $scriptDir + '\dsh-tray.ps1" -AutoStart'))
+  # 快捷方式/托盘打开同样升级为快速启动器 (与登录路径同一套探活 + 直启 node)
+  [void](Write-OpenLauncher)
   # Run 键兜底值同样走 wscript + 隐藏启动器 (仅任务注册失败时使用, 也绝不闪现终端)
   $value = '"' + (Join-Path $env:SystemRoot 'System32\wscript.exe') + '" "' + $companionVbsFile + '"'
   # 1) 首选 COM 注册 (无引号解析问题, 不依赖 schtasks.exe)
@@ -1935,6 +2317,17 @@ if ($ShortcutOk) {
       $ok = ($target -like '*wscript.exe') -and
             ($args -like ('*' + $scriptDir + '*')) -and
             ($args -like '*dsh-open.vbs*')
+      # v7.7: 启动器内容也校验版本标记 —— 旧版 dsh-open.vbs (纯 PowerShell 伴侣,
+      # node 排在窗口准备之后) 会被判过期, 宿主插件随即调用 -Install 重建为快速
+      # 启动器 (探活 + 直启 node)。
+      if ($ok) {
+        if (Test-Path $openVbsFile) {
+          $vbsText = Get-Content -Path $openVbsFile -Raw -ErrorAction SilentlyContinue
+          $ok = ($null -ne $vbsText) -and ($vbsText -like '*DSH_OPEN_LAUNCHER_V2*')
+        } else {
+          $ok = $false
+        }
+      }
     }
   } catch { $ok = $false }
   if ($ok) { exit 0 } else { exit 1 }
@@ -2076,12 +2469,14 @@ if ($Open) {
 # -RetargetWhenReady: 登录自启动的补位进程 —— 等 Harness 就绪后, 用 DevTools
 # 协议把已打开的启动页窗口原地导航到带 token 的认证页 (单窗口)。
 if ($RetargetWhenReady) {
-  for ($i = 0; $i -lt 720; $i++) {
+  for ($i = 0; $i -lt 960; $i++) {
     if (Test-HarnessHttp) {
-      # 服务就绪: 原地切换启动页窗口 (见 Switch-BootWindowToHarness)
-      Start-Sleep -Milliseconds 700
-      [void](Switch-BootWindowToHarness)
-      break
+      # 服务就绪: 等认证 URL 落盘 (插件树加载完成) 再把启动页窗口切过去 ——
+      # 在插件树就绪前导航, 前端 RPC 会 404 退避重试 (左侧会话加载慢)。
+      [void](Wait-HarnessToken)
+      $switched = Switch-BootWindowToHarness
+      # 服务在等待期间崩溃/重启时 Switch 返回 not-ready: 继续等下一轮就绪。
+      if ($switched -eq 'cdp' -or $switched -eq 'fallback') { break }
     }
     Start-Sleep -Milliseconds 500
   }
@@ -2091,6 +2486,42 @@ if ($RetargetWhenReady) {
 # -WatchAppWindow: 窗口看守进程 (由 -Open/-AutoStart 启动, 隐藏运行, 自行退出)
 if ($WatchAppWindow) {
   Start-WatchAppWindow
+  exit 0
+}
+
+# -AutoStartWeb: 登录自启动的"网页端模式"补位进程 (由 -AutoStart 在
+# autoStartMode = 'web' 时隐藏拉起)。职责只有两件: 等服务就绪, 然后打开默认浏览器。
+# 严格只读: 绝不 Start-Harness、绝不 Open-HarnessWindow、绝不写 app-window.json,
+# 因此不存在与 -AutoStart / 启动器抢端口或互相打断的可能。
+# 服务在 120 秒内没起来就放弃 (启动器失败时由 -AutoStart 的兜底负责拉起,
+# 本进程只负责"打开浏览器"这一件事)。
+if ($AutoStartWeb) {
+  $ready = $false
+  for ($i = 0; $i -lt 240; $i++) {
+    if (Test-HarnessHttp) { $ready = $true; break }
+    Start-Sleep -Milliseconds 500
+  }
+  if ($ready) {
+    # 等认证 URL 落盘 (插件树加载完成), 浏览器打开时前端即可直接连上 API;
+    # 拿不到就回退 origin (浏览器里已认证时 cookie 直接生效)。
+    $url = Wait-HarnessToken
+    if (-not $url) {
+      for ($k = 0; $k -lt 25; $k++) {
+        $url = Get-HarnessAuthUrl
+        if ($url) { break }
+        Start-Sleep -Milliseconds 200
+      }
+    }
+    # 等待期间实例可能已崩溃/重启: 只有仍能应答才打开, 避免浏览器停在拒绝连接页。
+    if (-not (Test-HarnessHttp)) { $ready = $false }
+  }
+  if ($ready) {
+    if (-not $url) { $url = $origin }
+    try { Start-Process $url } catch { }
+    Write-OpenState $true 0 'default' $null $null
+  } else {
+    Write-OpenState $false 120000 $null 'harness did not become ready within 120s (web auto-start)' $null
+  }
   exit 0
 }
 
@@ -2107,25 +2538,42 @@ if ($AutoStart) {
   if (-not (Test-TrayRunning)) {
     try { $PID | Set-Content -Path $pidFile -Encoding ASCII } catch {}
   }
+  # 上一会话的应用窗口记录必然过期 (重启后 PID 已失效), 直接清除,
+  # 避免 Open-HarnessWindow 的 CIM 回退通道在开机初期被 WMI 阻塞
+  Remove-Item $appWindowFile -Force -ErrorAction SilentlyContinue
+  $autoStartMode = 'desktop'
+  if ($state.autoStartMode -eq 'web') { $autoStartMode = 'web' }
+  # 桌面端模式: 先开启动页窗口 (数秒内可见) 再确保服务 —— 冷启动期间用户立刻
+  # 能看到"正在启动", 不必空等 ensure 的数十秒; 服务就绪后由 -RetargetWhenReady
+  # 用 DevTools 协议原地切换到认证页。网页端模式没有可提前打开的窗口, 保持
+  # "先确保服务, 再由 -AutoStartWeb 打开浏览器"的顺序。
+  if ($autoStartMode -ne 'web') {
+    [void](Open-HarnessWindow -Boot)
+    Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-RetargetWhenReady'
+  }
   if (-not (Test-HarnessHttp)) {
     $launcher = New-Object System.Threading.Mutex($false, $launchMutexName)
     $owned = $false
     try { $owned = $launcher.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true } catch { $owned = $false }
     if ($owned) {
       try {
-        # 任务动作 (wscript 启动器) 可能已在 PowerShell 冷启动期间直接拉起服务:
-        # 启动器标记存在且确有 node 进程在运行 → 信任启动器, 不重复拉起。
-        # (Get-Process 纯 Win32, 不依赖开机初期未就绪的 WMI; 标记在决定后即清除)
-        $launcherStarted = (Test-Path $launchMarkFile) -and ($null -ne (Get-Process node -ErrorAction SilentlyContinue))
+        # 任务动作① (wscript 启动器) 几乎必然已在 PowerShell 冷启动期间拉起服务。
+        # v0.8: 判断依据从"全系统存在任意 node.exe"改为"启动器刚写下的时间戳仍然
+        # 新鲜 (harness-launch.tmp)"。旧判定的缺陷: 只要机器上有任何无关的 node.exe,
+        # 就认为"启动器已拉起" —— 启动器真失败时服务永远起不来; 反过来在启动器尚未
+        # 生效的窗口里又会抢着再拉一个, 两个 node 撞 EADDRINUSE (日志里的实证)。
+        $launcherStarted = (Get-LaunchMarkAgeSec) -lt $launchMarkFreshSec
         if (-not (Test-HarnessTcp) -and -not $launcherStarted) {
           [void](Start-Harness)
         } elseif (-not (Test-HarnessTcp)) {
-          # 信任启动器但端口尚未监听: 有界观察最多 15 秒 —— 启动器拉起的进程
-          # 可能不是 harness (如开机时其它软件恰好在跑 node.exe), 或已崩溃;
-          # 端口一直不起就自行拉起, 保证服务必然可用。
+          # 信任启动器但端口尚未监听: 有界观察最多 25 秒 —— 启动器拉起的进程
+          # 可能已崩溃 (版本升级后 profile 构建失败等), 或根本不是 harness;
+          # 端口一直不起才自行兜底拉起 (此时 Start-Harness 的端口闸门仍会兜底
+          # 拒绝重复实例, 所以这里不存在"抢端口"的可能)。
           $launchT0 = [Environment]::TickCount
-          while ([Environment]::TickCount - $launchT0 -lt 15000) {
+          while ([Environment]::TickCount - $launchT0 -lt 25000) {
             if (Test-HarnessTcp) { break }
+            if (-not (Test-LaunchLikelyInProgress)) { break }
             Start-Sleep -Milliseconds 300
           }
           if (-not (Test-HarnessTcp)) { [void](Start-Harness) }
@@ -2137,15 +2585,16 @@ if ($AutoStart) {
     } else {
       try { $launcher.Dispose() } catch { }
     }
-    Remove-Item $launchMarkFile -Force -ErrorAction SilentlyContinue
   }
-  # 上一会话的应用窗口记录必然过期 (重启后 PID 已失效), 直接清除,
-  # 避免 Open-HarnessWindow 的 CIM 回退通道在开机初期被 WMI 阻塞
-  Remove-Item $appWindowFile -Force -ErrorAction SilentlyContinue
-  [void](Open-HarnessWindow -Boot)
-  # 启动页窗口出现后, 另起一个隐藏进程在服务就绪时用 DevTools 协议把该窗口
-  # 原地切换到带 token 的认证页 (同一个窗口, 见 Switch-BootWindowToHarness)。
-  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-RetargetWhenReady'
+  # 启动器标记使命结束: 无论本次是否走过 ensure 分支都清掉。旧代码只在
+  # "服务未就绪"分支删除 —— 服务恰好已就绪时标记会留到 5 分钟后, 让下一次
+  # 快捷方式打开在 Start-Harness 的端口闸门里白等。
+  Remove-Item $launchMarkFile -Force -ErrorAction SilentlyContinue
+  if ($autoStartMode -eq 'web') {
+    # 网页端模式: 只把 Harness 用默认浏览器打开, 绝不创建独立桌面窗口。
+    # 服务已在上面确保; 端口没起来时 -AutoStartWeb 只等就绪, 不会再拉进程。
+    Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-AutoStartWeb'
+  }
   # 自动迁移 (不阻塞上面的启动流程): 本次若仍由 Run 键触发 (计划任务未创建过),
   # 立即迁移到计划任务登录触发器并删除 Run 键 —— 下次登录起不再被 Explorer 的
   # 启动项队列拖慢。迁移失败 (如计划任务服务被禁用) 时保持 Run 键, 行为与旧版一致。
@@ -2183,10 +2632,9 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $openItem = New-Object System.Windows.Forms.ToolStripMenuItem('打开 DeepSeek Harness')
 # 打开逻辑放到独立进程执行, 避免阻塞托盘 UI
 $openItem.Add_Click({
-  # 用 Start-Process 的 -WindowStyle Hidden 开关 (而非 powershell.exe 的命令行参数):
-  # 它在 Win32 层以 SW_HIDE 创建子进程, 控制台从头到尾都不会出现; 而
-  # 'powershell.exe -WindowStyle Hidden' 作为参数要等 CLR 启动完成后才生效, 会闪现终端。
-  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+  # v7.7: 经快速启动器 (wscript -> 探活 -> 需要时直启 node -> 隐藏 PowerShell -Open)。
+  # 启动器缺失时 Start-OpenFlow 内部退回旧路径, 功能不受影响。
+  Start-OpenFlow
 })
 $restartItem = New-Object System.Windows.Forms.ToolStripMenuItem('重新启动')
 $restartItem.Add_Click({
@@ -2210,14 +2658,14 @@ $quitItem.Add_Click({
 [void]$menu.Items.Add($quitItem)
 $notify.ContextMenuStrip = $menu
 $notify.Add_DoubleClick({
-  Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+  Start-OpenFlow
 })
 # 左键单击图标: 启动/恢复 Harness 并打开桌面窗口 (与双击、桌面快捷方式同一路径;
 # 命令行走的就是 -Open → Ensure-Harness 复用已有实例, 不会抢占端口或重复启动)
 $notify.Add_MouseClick({
   param($sender, $e)
   if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-    Start-Process 'powershell.exe' -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $scriptDir + '\dsh-tray.ps1"'),'-Open'
+    Start-OpenFlow
   }
 })
 

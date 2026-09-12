@@ -4,18 +4,18 @@
 
 # 🐋 Dsh-Desktop
 
-**DeepSeek Harness 桌面端伴侣插件** —— 托盘鲸鱼图标 · 桌面快捷方式 · 开机自启直达桌面窗口 · 一键切换桌面/Web 模式
+**DeepSeek Harness 桌面端伴侣插件** —— 托盘鲸鱼图标 · 桌面快捷方式 · 开机自启（按设置打开桌面端或网页端） · 一键切换桌面/Web 模式
 
 ![cover](assets/cover.png)
 
 [![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-1e3a8a?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![type](https://img.shields.io/badge/type-Web%20Plugin-818cf8?style=flat-square)](cordis.patch.yml)
-[![version](https://img.shields.io/badge/version-0.7.8-38bdf8?style=flat-square)](package.json)
+[![version](https://img.shields.io/badge/version-0.8.1-38bdf8?style=flat-square)](package.json)
 [![license](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0ea5e9?style=flat-square)](#环境要求)
 [![node](https://img.shields.io/badge/node-%3E%3D20-6366f1?style=flat-square)](package.json)
 
-**DeepSeek Harness 桌面端伴侣插件：托盘鲸鱼图标、桌面快捷方式、开机自启直达桌面窗口，一键切换桌面/Web 模式。**
+**DeepSeek Harness 桌面端伴侣插件：托盘鲸鱼图标、桌面快捷方式、开机自启（按设置打开桌面端独立应用窗口或网页端浏览器），一键切换桌面/Web 模式。**
 
 </div>
 
@@ -32,23 +32,26 @@
 | 特性 | 说明 |
 | --- | --- |
 | 🐋 **系统托盘伴侣** | 通知区域鲸鱼图标，**左键单击一键唤起/聚焦**，右键菜单提供 **打开 / 重新启动 / 退出**，随时掌控 Harness |
-| 🖥️ **原生桌面窗口** | 本地 Chromium 应用模式（`--app`）渲染：1352:972 自适应比例、屏幕居中、可自由缩放；独立浏览器 profile，扩展/通知/登录提示绝不泄漏进窗口，无启动闪烁 |
+| 🖥️ **原生桌面窗口** | 本地 Chromium 应用模式（`--app`）渲染：1352:972 自适应比例、屏幕居中、可自由缩放；独立浏览器 profile，自动抑制 Google 翻译弹窗，扩展/通知/登录提示绝不泄漏进窗口，无启动闪烁 |
 | 🔄 **一键切换桌面/Web** | 设置页按钮随当前状态显示 **切换桌面端 / 切换网页端**，状态自动检测（无需 WMI），标签始终真实可靠 |
-| ⚡ **秒级启动 · 原地 DevTools 导航** | 登录任务以 `wscript.exe` 隐藏启动器（冷启动 <1s）直接拉起 `node <entry> web --no-open`；冷启动**提前显示内置启动页**（3–5s 可见），服务就绪后通过 **DevTools 协议原地导航**到认证地址，单窗口无缝切换、无 401 卡死、无端口冲突 |
-| 🔁 **开机自启** | 注册**任务计划程序登录触发器**（`DSHDesktop` 任务，无需管理员权限；`HKCU\...\Run` 仅作注册失败时的兜底），登录瞬间即触发，不排队等待启动队列 |
+| ⚡ **秒级启动 · 快捷方式先起服务** | 快捷方式与登录任务由专用极速启动器（`dsh-open.vbs` / `dsh-autostart.vbs`）直启服务，窗口并行准备；冷启动**提前显示内置启动页**（3–5s 可见），服务就绪后通过 **DevTools 协议原地导航**到认证地址，单窗口无缝切换、无 401 卡死、无端口冲突 |
+| 🔁 **开机自启（方式二选一）** | 注册**任务计划程序登录触发器**（`DSHDesktop` 任务，无需管理员权限；`HKCU\...\Run` 仅作注册失败时的兜底）；启动器内嵌 `--no-open`，并支持 **`autoStartMode` 设置（桌面端独立窗口 / 网页端默认浏览器）**，只开所选一端，绝不重复弹出两个窗口 |
 | 🚀 **全程无终端闪现** | 所有外部 PowerShell 启动（快捷方式 / 托盘 / 登录任务）都经 `wscript.exe` 隐藏运行器（Win32 `SW_HIDE`），开机、打开、切换全程**无控制台窗口闪现** |
-| 🛡️ **退出即重开 · 托盘自愈 · 竞态防护** | 退出后立刻重开；单次启动请求互斥锁让重复点击立即忽略，不再重复拉起 Node；`Test-HarnessHttp` 适配 401 认证响应，删除一切 20s 强杀逻辑，完美接管外部/CLI 实例 |
+| 🛡️ **端口安全 · 熔断保护 · 托盘自愈** | 退出后立刻重开；精确启动标记 + 端口闸门杜绝并发拉起 Node 抢端口；连续 3 次失败自动熔断写入 `launch-failures.json`；启动标记全生命周期清理 |
 | 🪟 **终端显隐** | 设置页一键显示/隐藏 Harness 终端窗口，控制台随心切换 |
-| ⚙️ **原生设置面板** | DSH Web UI 内新增 **桌面端** 设置区：状态卡片、一键操作、上次打开诊断 |
+| ⚙️ **原生设置面板** | DSH Web UI 内新增 **桌面端** 设置区：首屏骨架屏秒开、去除冗余探测、支持开机打开方式选择、状态卡片与上次打开诊断 |
 
-### 0.7.8 本次迭代
+### 0.8.1 / 0.8.0 本次迭代
 
-- **修复抢占端口/反复拉起**：`Test-HarnessHttp` 正确识别 401 认证就绪，删除 20s 强杀僵尸逻辑，全面接管 CLI/外部实例；后台启动追加 `--no-open` 防止弹默认浏览器。
-- **修复重启/重开 401 卡死**：精准解析 CLI token 认证地址（带时间戳新鲜度校验），首次打开与重开均通过认证栅栏。
-- **DevTools 协议单窗口原地切换**：冷启动（`-Open` / `-Restart` / `-AutoStart`）3~5s 内先弹出启动页，服务就绪后通过 Chrome DevTools Protocol 原地导航至认证页，彻底解决跨站 `SameSite=Strict` cookie 限制与双窗口 bug。
-- **托盘左键单击**：支持左键单击托盘图标一键打开/唤起桌面窗口。
+- **快捷方式提速**：`dsh-open.vbs` 升级为快速启动器，探测服务并直启 Node，Node 冷启动不再串行排在 PowerShell 冷启动与窗口准备之后。
+- **修复开机同时弹两个窗口**：登录启动器补上 `--no-open`，彻底解决 DSH 自行弹默认浏览器与插件桌面窗口并存的必现问题。
+- **新增开机打开方式设置 (`autoStartMode`)**：设置页新增开机打开方式选项（桌面端独立窗口 / 网页端默认浏览器，二选一），严格只开一端。
+- **端口闸门与防无限重启**：重写 `Start-Harness` 端口等待逻辑，检测到冷启动中的 Node 进程时绝不并发拉起第二个实例；`Ensure-Harness` 增加 3 次失败自动熔断保护（写入 `launch-failures.json`）。
+- **抑制 Chromium 翻译弹窗**：独立 profile 自动写入 `translate.enabled: false`，彻底消除 Chrome 138+ 弹出的 Google 翻译气泡。
+- **就绪判定与端口纠错**：`Test-HarnessHttp` 拒绝启动期 404，`Wait-HarnessToken` 等待插件树完整加载后才开启窗口（解决左侧会话加载延迟）；`harness.json` 自动以 `webServer.port` 真实端口纠错。
+- **性能与开销优化**：同内容跳过文件重复写入；稳态启动通过文件时间戳直接判定，不再为快捷方式/自启确认而额外启动 PowerShell；设置面板加入骨架屏并去除冗余探测。
 
-### 0.7.7 历史迭代
+### 0.7.8 / 0.7.7 历史迭代
 
 ## 📦 安装方法
 
@@ -114,7 +117,7 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 | 面板 | 功能 |
 | --- | --- |
 | 状态 | Harness 服务、托盘、桌面窗口、桌面快捷方式、自启、终端的实时状态 |
-| 开机自启动 | 开关登录自启（任务计划程序登录触发器，Run 键兜底）；开启后登录即秒级拉起服务，直接打开带启动页的桌面窗口 |
+| 开机自启动 | 开关登录自启（任务计划程序登录触发器，Run 键兜底）；可选择 **开机打开方式**（桌面端独立应用窗口 / 网页端默认浏览器，二选一，只开一端） |
 | 操作 | **切换桌面端 / 切换网页端**（按当前模式显示标签）、启动/退出托盘、创建桌面快捷方式、显示/隐藏终端 |
 
 托盘右键菜单中的 **重新启动** 会按顺序停止并重新启动 Harness，保留托盘图标和开机自启动设置；重启期间重复点击快捷方式或“重新启动”不会创建额外的 Node 实例。
@@ -127,10 +130,11 @@ dsh plugin --profile web remove "@dsh-external/dsh-desktop"
 | --- | --- |
 | 伴生文件目录 | `%LOCALAPPDATA%\dsh-desktop\`（自动从 v0.1 的 `$DSH_HOME\desktop` 迁移） |
 | `dsh-tray.ps1` | 托盘/启动器核心脚本（窗口布局、单实例、就绪轮询、退出信号） |
-| `harness.json` | 记录当前安装的精确 CLI 入口、node、DSH_HOME、origin、端口 |
-| `state.json` | `showTerminal` / `autoStart` 状态 |
+| `harness.json` | 记录当前安装的精确 CLI 入口、node、DSH_HOME、origin、实际绑定端口 |
+| `state.json` | `showTerminal` / `autoStart` / `autoStartMode` 状态 |
 | `open-state.json` | 上次打开诊断（就绪耗时、窗口模式） |
-| 启动页 | `boot.html`——服务就绪前桌面窗口显示的黑色鲸鱼白底启动页，就绪后自动跳转 UI |
+| `launch-failures.json` | 熔断诊断文件（仅在连续 3 次拉起失败触发熔断时生成，记录原因与日志路径） |
+| 启动页 | `boot.html`——服务就绪前桌面窗口显示的黑色鲸鱼白底启动页，就绪后通过 DevTools 原地导航到 UI |
 | 自启方式 | 任务计划程序登录触发器（`DSHDesktop` 任务，无需管理员权限）；`HKCU\...\Run` 仅注册失败时兜底；当前生效方式见 `%LOCALAPPDATA%\dsh-desktop\autostart-method.json`（`task` / `runkey`） |
 | 桌面/Web 状态检测 | 双通道：记录窗口 PID（主）+ WMI 命令行匹配（兜底），无 WMI 环境同样可靠 |
 | 运行时依赖 | `schemastery`（唯一运行时依赖） |
